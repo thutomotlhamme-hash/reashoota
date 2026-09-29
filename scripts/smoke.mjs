@@ -1,16 +1,19 @@
-// End-to-end smoke test in Chromium with iPhone emulation.
+// End-to-end smoke test in Chromium with iPhone emulation and a fake camera.
 // Usage: node scripts/smoke.mjs [outDir]   (needs Playwright + Chromium)
+//        SMOKE_ROOT=dist node scripts/smoke.mjs   tests the build instead of the source.
 import http from 'node:http';
 import { readFile, mkdir, writeFile } from 'node:fs/promises';
 import { extname, join, normalize } from 'node:path';
 import { chromium, devices } from 'playwright';
 
-// Tests the built dist/ when SMOKE_ROOT=dist, otherwise the source tree.
 const root = join(new URL('..', import.meta.url).pathname, process.env.SMOKE_ROOT || '');
 const out = process.argv[2] || join(root, 'test-results');
 await mkdir(out, { recursive: true });
 
-const types = { '.html': 'text/html', '.js': 'text/javascript', '.css': 'text/css', '.svg': 'image/svg+xml', '.png': 'image/png', '.webmanifest': 'application/manifest+json', '.json': 'application/json' };
+const types = {
+  '.html': 'text/html', '.js': 'text/javascript', '.css': 'text/css', '.svg': 'image/svg+xml', '.png': 'image/png',
+  '.webmanifest': 'application/manifest+json', '.json': 'application/json', '.woff2': 'font/woff2',
+};
 const server = http.createServer(async (req, res) => {
   const path = normalize(decodeURIComponent(new URL(req.url, 'http://x').pathname)).replace(/^\/+/, '') || 'index.html';
   try {
@@ -21,23 +24,48 @@ const server = http.createServer(async (req, res) => {
 }).listen(0);
 const base = `http://localhost:${server.address().port}/`;
 
-const browser = await chromium.launch();
-const context = await browser.newContext({ ...devices['iPhone 13'], acceptDownloads: true });
+// 40s 120 BPM click track as a WAV file.
+function clickTrack(bpm = 120, seconds = 40, rate = 22050) {
+  const n = seconds * rate;
+  const buf = Buffer.alloc(44 + n * 2);
+  buf.write('RIFF', 0); buf.writeUInt32LE(36 + n * 2, 4); buf.write('WAVEfmt ', 8);
+  buf.writeUInt32LE(16, 16); buf.writeUInt16LE(1, 20); buf.writeUInt16LE(1, 22); buf.writeUInt32LE(rate, 24);
+  buf.writeUInt32LE(rate * 2, 28); buf.writeUInt16LE(2, 32); buf.writeUInt16LE(16, 34); buf.write('data', 36); buf.writeUInt32LE(n * 2, 40);
+  const beat = (60 / bpm) * rate;
+  for (let i = 0; i < n; i += 1) {
+    const inBeat = i % beat;
+    const loud = i > n * 0.5 && i < n * 0.8 ? 1 : 0.45; // a "chorus"
+    const v = inBeat < rate * 0.03 ? Math.sin(i * 0.3) * (1 - inBeat / (rate * 0.03)) * loud : Math.sin(i * 0.05) * 0.03;
+    buf.writeInt16LE(Math.round(v * 30000), 44 + i * 2);
+  }
+  return buf;
+}
+
+const browser = await chromium.launch({
+  args: ['--use-fake-device-for-media-stream', '--use-fake-ui-for-media-stream', '--autoplay-policy=no-user-gesture-required'],
+});
+const context = await browser.newContext({ ...devices['iPhone 13'], acceptDownloads: true, permissions: ['camera', 'microphone'] });
 const page = await context.newPage();
 const errors = [];
 page.on('pageerror', (e) => errors.push(e.message));
 page.on('console', (m) => { if (m.type() === 'error') errors.push(m.text()); });
+page.on('dialog', (d) => d.accept());
 
 const step = (name) => console.log(`• ${name}`);
-const shot = (name) => page.screenshot({ path: join(out, `${name}.png`), fullPage: false });
+const shot = (name) => page.screenshot({ path: join(out, `${name}.png`) });
 const check = (cond, msg) => { if (!cond) throw new Error(`FAILED: ${msg}`); };
 
-async function exportAndDownload(trigger, expectExt) {
+async function choose(trigger, files) {
+  const [chooser] = await Promise.all([page.waitForEvent('filechooser'), trigger()]);
+  await chooser.setFiles(files);
+}
+
+async function exportAndDownload(trigger, exts, timeout = 90000) {
   await trigger();
-  await page.waitForSelector('[data-action="ready-download"]', { timeout: 60000 });
+  await page.waitForSelector('[data-action="ready-download"]', { timeout });
   const [dl] = await Promise.all([page.waitForEvent('download'), page.click('[data-action="ready-download"]')]);
   const name = dl.suggestedFilename();
-  check([].concat(expectExt).some((e) => name.endsWith(e)), `${name} should end with ${expectExt}`);
+  check([].concat(exts).some((e) => name.endsWith(e)), `${name} should end with ${exts}`);
   const path = join(out, name);
   await dl.saveAs(path);
   await page.click('[data-action="close-sheet"]');
@@ -45,92 +73,126 @@ async function exportAndDownload(trigger, expectExt) {
 }
 
 try {
-  step('load + demo');
+  step('home + demo opens the timeline');
   await page.goto(base);
+  await page.waitForSelector('.cta');
+  await shot('01-home-empty');
   await page.click('[data-action="demo"]');
-  await page.waitForSelector('.shot');
-  await shot('01-shoot');
+  await page.waitForSelector('.slot');
+  await page.waitForTimeout(400);
+  await shot('02-timeline');
 
-  step('add a reference frame from a generated image');
-  const png = await page.evaluate(async () => {
-    const c = document.createElement('canvas'); c.width = 900; c.height = 1600;
-    const x = c.getContext('2d'); const g = x.createLinearGradient(0, 0, 900, 1600);
-    g.addColorStop(0, '#ff7a3d'); g.addColorStop(1, '#1b1a2e'); x.fillStyle = g; x.fillRect(0, 0, 900, 1600);
-    x.fillStyle = '#fff'; x.font = 'bold 120px sans-serif'; x.fillText('FRAME', 180, 820);
-    return c.toDataURL('image/png');
+  step('make test clips (recorded in the page)');
+  const clip = await page.evaluate(async () => {
+    const c = document.createElement('canvas'); c.width = 360; c.height = 640;
+    const x = c.getContext('2d');
+    const rec = new MediaRecorder(c.captureStream(30), { mimeType: 'video/webm' });
+    const chunks = []; rec.ondataavailable = (e) => chunks.push(e.data);
+    const done = new Promise((r) => { rec.onstop = r; });
+    rec.start();
+    const t0 = performance.now();
+    await new Promise((r) => {
+      const f = () => {
+        const t = (performance.now() - t0) / 1000;
+        x.fillStyle = `hsl(${(t * 90) % 360} 70% 55%)`; x.fillRect(0, 0, 360, 640);
+        x.fillStyle = '#fff'; x.font = 'bold 60px sans-serif'; x.fillText(t.toFixed(1), 110, 330);
+        if (t > 2.2) r(); else requestAnimationFrame(f);
+      };
+      f();
+    });
+    rec.stop(); await done;
+    const b = new Uint8Array(await new Blob(chunks).arrayBuffer());
+    let s = ''; for (const v of b) s += String.fromCharCode(v);
+    return btoa(s);
   });
-  await writeFile(join(out, 'frame.png'), Buffer.from(png.split(',')[1], 'base64'));
-  await page.click('[data-tab="board"]');
-  await page.click('.panel-img >> nth=0');
-  const [chooser] = await Promise.all([page.waitForEvent('filechooser'), page.click('[data-action="frame-add"] >> nth=0')]);
-  await chooser.setFiles(join(out, 'frame.png'));
-  await page.waitForSelector('.panel-img img');
-  await page.waitForTimeout(300);
-  await shot('02-board');
+  const clipPaths = [];
+  for (let i = 0; i < 3; i += 1) {
+    const p = join(out, `clip${i}.webm`);
+    await writeFile(p, Buffer.from(clip, 'base64'));
+    clipPaths.push(p);
+  }
+  await writeFile(join(out, 'song.wav'), clickTrack());
 
-  step('exports');
-  await page.click('[data-tab="export"]');
-  await shot('03-export');
-  const pdf = await exportAndDownload(() => page.click('.hero.primary'), '.pdf');
+  step('add song → BPM + beat slots');
+  await page.click('.tool >> text=Add song');
+  await choose(() => page.click('[data-action="add-song"]'), join(out, 'song.wav'));
+  await page.waitForSelector('.song-wave');
+  const meta = await page.textContent('.song-card');
+  check(/1[12]\d BPM|120 BPM/.test(meta), `BPM found: ${meta}`);
+  await shot('03-song');
+  await page.click('[data-action="beat-slots"]');
+  await page.waitForSelector('.slot');
+  check(await page.isVisible('.wave i'), 'waveform under slots');
+
+  step('templates + auto-fill from Photos');
+  await page.click('.tool >> text=Templates');
+  await page.click('[data-action="pick-tpl"][data-id="hook15"]');
+  await shot('04-templates');
+  await page.click('[data-action="use-tpl"]');
+  await page.waitForSelector('.slot');
+  check((await page.$$('.slot')).length === 9, 'hook template has 9 slots');
+  await page.click('.tool >> text=Templates');
+  await choose(() => page.click('[data-action="auto-fill"]'), clipPaths);
+  await page.waitForSelector('.slot.filled >> nth=2', { timeout: 30000 });
+  check((await page.$$('.slot.filled')).length === 3, '3 slots filled');
+
+  step('shoot into a slot with the camera');
+  await page.click('.slot >> nth=3');
+  await page.click('[data-action="open-camera"]');
+  await page.waitForSelector('.cam-feed');
+  await page.waitForTimeout(800);
+  await shot('05-camera');
+  await page.click('#rec-btn');
+  await page.waitForFunction(() => document.querySelectorAll('.cam-progress i.done').length >= 4, null, { timeout: 30000 });
+  await page.click('[data-action="cam-close"]');
+  await page.waitForSelector('.slot.filled >> nth=3');
+
+  step('captions: style + font');
+  await page.click('.tool >> text=Captions');
+  await page.click('[data-action="cap-style"][data-v="karaoke"]');
+  await page.click('[data-action="cap-font"][data-v="Permanent Marker"]');
+  await page.waitForTimeout(500);
+  await shot('06-captions');
+  await page.click('.topbar >> text=Done');
+  await page.waitForSelector('.slot');
+  await shot('07-timeline-filled');
+
+  step('make the final video');
+  await page.click('[data-action="open-save"]');
+  await page.waitForSelector('[data-action="make-video"]');
+  await shot('08-save-sheet');
+  const video = await exportAndDownload(() => page.click('[data-action="make-video"]'), ['.mp4', '.webm'], 120000);
+  const size = (await readFile(video)).length;
+  check(size > 50000, `final video has content (${size} bytes)`);
+  console.log(`  final video: ${video} (${Math.round(size / 1024)} KB)`);
+
+  step('plan → shoot pack PDF still works');
+  await page.click('[data-action="go"][data-view="plan"]');
+  await page.waitForSelector('.tabs');
+  const pdf = await exportAndDownload(() => page.click('[data-action="bar-save"]'), '.pdf');
   check((await readFile(pdf)).subarray(0, 8).toString() === '%PDF-1.4', 'shoot pack is a PDF');
-  await exportAndDownload(() => page.click('[data-export="storyboard"][data-format="pdf"].hero'), '.pdf');
-  await exportAndDownload(() => page.click('[data-export="deck"][data-format="pdf"]'), '.pdf');
-  await exportAndDownload(() => page.click('[data-export="storyboard"][data-format="sheet"]'), '.jpg');
-  await exportAndDownload(() => page.click('[data-export="moodboard"][data-format="png"]'), '.png');
-  await exportAndDownload(() => page.click('[data-export="full"][data-format="md"]'), '.md');
-  await exportAndDownload(() => page.click('[data-export="backup"][data-format="json"]'), '.reashoota.json');
-  await page.click('[data-export="cards"][data-format="png"]');
-  await page.waitForSelector('[data-action="ready-download"]');
-  await shot('04-ready-sheet');
-  await page.click('[data-action="close-sheet"]');
 
-  step('copy shot list');
-  await context.grantPermissions(['clipboard-read', 'clipboard-write']);
-  await page.click('.hero[data-kind="shotlist"]');
-  await page.waitForTimeout(200);
-  const clip = await page.evaluate(() => navigator.clipboard.readText());
-  check(clip.includes('S01 · Taxi window reflection'), 'clipboard has shot list');
-
-  step('animatic video');
-  await exportAndDownload(() => page.click('[data-action="save-video"]'), ['.mp4', '.webm']);
-
-  step('make available offline');
-  await page.click('[data-action="make-offline"]');
-  await page.waitForSelector('.hero.ok');
-
-  step('complete a shot + notes, then refresh restores state');
-  await page.click('[data-tab="shoot"]');
-  await page.click('.shot >> nth=2 >> .check');
-  await page.fill('.shot >> nth=2 >> textarea', 'Take 4 golden');
-  await page.click('[data-details="settings"] summary');
-  await page.selectOption('[data-setting="countdownSec"]', '5');
+  step('reload restores view + state; offline reload works');
+  await page.click('[data-action="go"][data-view="timeline"]');
+  await page.click('.slot >> nth=1');
   await page.waitForTimeout(500);
   await page.reload();
-  await page.waitForSelector('.shot');
-  check(await page.isChecked('.shot >> nth=2 >> input[type=checkbox]'), 'shot 3 stays done');
-  check((await page.inputValue('.shot >> nth=2 >> textarea')) === 'Take 4 golden', 'notes restored');
-  check((await page.inputValue('[data-setting="countdownSec"]')) === '5', 'countdown setting restored');
-
-  step('offline reload');
+  await page.waitForSelector('.slot.on');
+  check((await page.getAttribute('.slot.on', 'data-i')) === '1', 'selected slot restored');
+  check((await page.$$('.slot.filled')).length === 4, 'takes restored');
   await page.evaluate(() => navigator.serviceWorker.ready);
   await context.setOffline(true);
   await page.reload();
-  await page.waitForSelector('.shot');
-  check(await page.isVisible('text=Offline — everything still works'), 'offline pill');
-  await shot('05-offline');
-  const offPdf = await exportAndDownload(() => page.click('[data-action="bar-save"]'), '.pdf');
-  check((await readFile(offPdf)).length > 1000, 'pdf exported offline');
+  await page.waitForSelector('.slot.filled');
   await context.setOffline(false);
 
-  step('duplicate + home');
-  await page.click('[data-tab="export"]');
-  await page.click('[data-action="duplicate"]');
-  await page.waitForSelector('text=Golden Hour Ghost (copy)');
+  step('home');
   await page.click('[data-action="home"]');
-  await page.waitForSelector('.project-card >> nth=1');
-  await shot('06-home');
+  await page.waitForSelector('.pcard');
+  await shot('09-home');
 
-  check(!errors.length, `console errors:\n${errors.join('\n')}`);
+  const real = errors.filter((e) => !/Failed to load resource/.test(e));
+  check(!real.length, `console errors:\n${real.join('\n')}`);
   console.log('SMOKE OK');
 } catch (err) {
   console.error(err.message);

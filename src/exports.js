@@ -11,10 +11,12 @@ import {
   canvasToBlob, jpegBytes, loadImage, renderMoodboard, renderShotCard, renderStoryboardSheet, toJpeg,
 } from './images.js';
 import { renderAnimatic } from './video.js';
+import { renderFinal } from './render.js';
+import { filledCount } from './timeline.js';
 
 export const FORMAT_LABEL = {
   pdf: 'PDF', txt: 'Text', md: 'Markdown', png: 'PNG', jpg: 'JPG',
-  sheet: 'Image', frames: 'Frames', video: 'MP4 9:16', json: 'Backup file',
+  sheet: 'Image', frames: 'Frames', video: 'Video', json: 'Backup file',
 };
 
 export const EXPORTS = [
@@ -32,7 +34,9 @@ export const EXPORTS = [
   { id: 'summary', label: 'Project summary', formats: ['pdf', 'txt', 'md'] },
   { id: 'cards', label: 'Shot cards', hint: 'One 9:16 image per shot for Photos', formats: ['png', 'jpg'] },
   { id: 'moodboard', label: 'Moodboard', formats: ['png', 'jpg'] },
+  { id: 'final', label: 'Your video', hint: 'Every filmed slot, the song and captions, 9:16', formats: ['video'] },
   { id: 'animatic', label: 'Storyboard animatic', hint: 'Vertical video of your frames', formats: ['video'] },
+  { id: 'clips', label: 'Every clip', hint: 'All takes, original quality', formats: ['video'] },
   { id: 'backup', label: 'Project backup', hint: 'Re-open on any device with Import', formats: ['json'] },
 ];
 
@@ -90,7 +94,7 @@ async function conceptImages(project) {
 const base = (project) => slugify(project.name);
 
 // Returns { files: File[], text?: string, title, message }
-export async function produce(project, id, format, { onProgress, signal } = {}) {
+export async function produce(project, id, format, { onProgress, onCanvas, signal } = {}) {
   const name = `${base(project)}-${id}`;
   const title = `${project.name} — ${exportLabel(id)}`;
   const message = `${exportLabel(id)} for “${project.name}”${project.artist ? ` (${project.artist})` : ''} — made with ReaShoota`;
@@ -146,10 +150,31 @@ export async function produce(project, id, format, { onProgress, signal } = {}) 
     return { files: [makeFile(blob, `${name}.${format}`, type)], title, message };
   }
 
+  if (id === 'final') {
+    if (!filledCount(project)) throw new Error('Shoot or add at least one clip first.');
+    const { blob, ext, type } = await renderFinal(project, { onProgress, onCanvas, signal });
+    return { files: [makeFile(blob, `${base(project)}.${ext}`, type)], title: `${project.name} — your video`, message };
+  }
+
   if (id === 'animatic') {
     if (!project.shots.length) throw new Error('Add shots first.');
     const { blob, ext, type } = await renderAnimatic(project, await shotImages(project), { onProgress, signal });
     return { files: [makeFile(blob, `${name}.${ext}`, type)], title, message };
+  }
+
+  if (id === 'clips') {
+    const files = [];
+    for (const [i, s] of project.shots.entries()) {
+      for (const [k, t] of (s.takes || []).entries()) {
+        const a = await getAsset(t.assetId);
+        if (!a) continue;
+        const ext = a.mime?.includes('mp4') ? 'mp4' : a.mime?.includes('quicktime') ? 'mov' : 'webm';
+        files.push(makeFile(a.blob, `${base(project)}-${shotLabel(project, s).toLowerCase()}-take${k + 1}.${ext}`, a.mime));
+      }
+      onProgress?.((i + 1) / project.shots.length);
+    }
+    if (!files.length) throw new Error('No clips filmed yet.');
+    return { files, title: `${project.name} — every clip`, message };
   }
 
   if (id === 'backup') {

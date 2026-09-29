@@ -1,8 +1,20 @@
 # ReaShoota
 
-A mobile-first creative director for music video shoots. It's built for an iPhone on location: plan the shots, shoot with the phone in your hand, and save everything to the phone. It keeps working with no signal.
+A mobile-first music video studio for iPhone. Plan the video, add your song, then shoot straight into timed slots on a CapCut-style timeline. Captions and beat-synced edit effects are added for you, and you save one finished 9:16 video to Photos. It all keeps working with no signal.
 
 It is a static PWA. There is no build step and nothing to install at runtime, so it can be deployed to any static host (Netlify config is included).
+
+## The studio
+
+- **Timeline:** every shot is a slot sized to its length, grouped by song section, over the song's waveform. Tap a slot to select it, **SHOOT** to film into it, **From Photos** to drop a clip in, and ▶ to play the whole edit with the song.
+- **Camera:** a live viewfinder with a framing grid, the shot's direction and lyric, and a countdown. The song plays through the countdown so the artist comes in on time, and the take stops at exactly the slot's length. It then moves to the next empty slot. **iPhone camera** uses the native camera instead, for full 4K quality.
+- **Templates (viral-ready):** Viral Hook 15, Beat Cut 30, Beat Drop 20, Verse → Chorus (60s), Performance + B-roll, and One-take Hook. Each sets the slot layout plus edit effects: *beat pulse* (a zoom bump on every beat), *flash cuts* and *punch-ins*. **Auto-fill** drops clips picked from Photos into the empty slots in order.
+- **Song:** add an MP3/M4A/WAV. ReaShoota finds the BPM and draws the waveform. Pick Full, Best 30s (the loudest stretch), a 15s hook, or a custom range. **Build slots on the beat** snaps every cut to half-bars.
+- **Lyrics & captions:** paste the lyrics, then **Tap to sync** once while the song plays. Captions appear word by word in one of four styles (Pop, Karaoke, Clean, Boxed) and six bundled fonts. They sit in the TikTok/Reels/Shorts safe zone, clear of the platform's buttons. Without syncing, each shot's lyric is spread across its slot.
+- **Final video:** **Save → Make video** renders a 1080×1920 video at 12 Mbps. It includes the song, burned-in captions, the edit effects, and a fade in and out. Unfilmed slots reuse the nearest clip. You watch it live while it renders, then save it to Photos from the share sheet. Safari on iPhone produces H.264/AAC MP4.
+- **Plan** (list icon): the original shot list, storyboard, creative direction, image rhymes, lyric map, checklist, media and every document export.
+
+Speech-to-text captions and AI clip generation need a server, and none ships with this repo yet.
 
 ## Download / export to phone
 
@@ -32,6 +44,8 @@ Obvious entry points: the **Export** tab has DOWNLOAD SHOOT PACK, SAVE STORYBOAR
 | Moodboard | PNG/JPG |
 | Individual reference frames, concept images | original file |
 | AI video clips, edited videos | original file (MP4/MOV) via SAVE VIDEO |
+| **Your video** | the finished 9:16 edit: takes + song + captions + effects |
+| Every clip | all takes, original quality |
 | Storyboard animatic | vertical 9:16 MP4 rendered on the device (WebM in browsers without MP4 recording) |
 | Project backup | `.reashoota.json` with all media, which re-opens with **Import** |
 
@@ -73,4 +87,8 @@ The build copies the app as-is (there is nothing to compile). It stamps the serv
 | `src/share.js` | save to phone / share / download / copy |
 | `src/store.js`, `src/offline.js`, `sw.js` | IndexedDB, offline mode, session restore, app-shell cache |
 | `src/backup.js`, `src/cloud.js` | portable bundle and account sync queue |
+| `src/timeline.js` | slot timing, templates, beat snapping, BPM detection, caption timing, auto-fill (pure, unit-tested) |
+| `src/render.js` | timeline player and final video render |
+| `src/audio.js`, `src/camera.js`, `src/captions.js` | song decode/analysis, in-app camera, caption styles |
+| `fonts/` | bundled Latin subsets (SIL Open Font License) so captions and UI work offline |
 | `src/app.js` | UI |

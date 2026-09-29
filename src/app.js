@@ -17,6 +17,15 @@ import { loadSession, makeAvailableOffline, registerServiceWorker, saveSession, 
 import * as cloud from './cloud.js';
 import { toJpeg } from './images.js';
 import { canRenderVideo } from './video.js';
+import {
+  TEMPLATES, FX_LABELS, PX_PER_SEC, applyTemplate, autoFillTargets, buildBeatSlots, filledCount, formatTime,
+  loudestWindow, slotTimes, songOffset, totalDuration, captionAt,
+} from './timeline.js';
+import { analyse, decodeSong, playSong, unlockAudio, audioContext } from './audio.js';
+import { TimelinePlayer, loadMedia } from './render.js';
+import { cameraSupported, closeCamera, openCamera, recordTake, videoThumb } from './camera.js';
+import { CAPTION_FONTS, CAPTION_STYLES, loadCaptionFont } from './captions.js';
+import { currentTake } from './project.js';
 
 const $ = (sel, root = document) => root.querySelector(sel);
 const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
@@ -31,11 +40,14 @@ const state = {
   pending: 0,
   busy: null, // { label, progress, abort }
   settingsOpen: false,
+  view: 'timeline', // timeline | plan | song | captions | templates (home when no project)
+  sel: 0, // selected slot
+  tpl: 'hook15',
 };
 
 const TABS = [
-  ['shoot', 'Shoot'], ['board', 'Board'], ['direction', 'Direction'],
-  ['checklist', 'Checklist'], ['media', 'Media'], ['export', 'Export'],
+  ['shoot', 'Shots'], ['board', 'Board'], ['direction', 'Direction'],
+  ['checklist', 'Checklist'], ['media', 'Media'], ['export', 'All exports'],
 ];
 
 // Tab-specific SAVE / SHARE / COPY bar — the most useful output for what's on screen.
@@ -74,7 +86,7 @@ async function flushSave() {
 }
 
 function persistSession() {
-  saveSession({ projectId: state.project?.id || null, tab: state.tab, scrollY: window.scrollY });
+  saveSession({ projectId: state.project?.id || null, tab: state.tab, view: state.view, sel: state.sel, scrollY: window.scrollY });
 }
 
 let syncTimer = null;
@@ -149,9 +161,17 @@ async function storeMedia(file, kind) {
 
 function render() {
   const app = $('#app');
-  app.innerHTML = state.project ? projectView() : homeView();
+  stopPlayback();
+  let html;
+  if (!state.project) html = homeView();
+  else if (state.view === 'plan') html = projectView();
+  else html = ({ timeline: timelineView, song: songView, captions: captionsView, templates: templatesView }[state.view] || timelineView)();
+  app.innerHTML = html;
+  document.body.dataset.view = state.project ? state.view : 'home';
   renderStatus();
   hydrateMedia(app);
+  if (state.project && (state.view === 'timeline' || state.view === 'captions')) refreshMonitor();
+  if (state.view === 'timeline') scrollSlotIntoView();
 }
 
 function renderStatus() {
@@ -163,38 +183,51 @@ function renderStatus() {
   el.innerHTML = net + acct;
 }
 
+function miniBars(p, filledOnly = true) {
+  const shades = ['#4b32d6', '#6c4dff', '#8f78ff', '#a996ff', '#cfc5ff'];
+  if (!p.shots.length) return '<div class="mini-bars"><span style="flex-grow:1" class="empty"></span></div>';
+  return `<div class="mini-bars">${p.shots.map((s, i) => {
+    const filled = filledOnly ? !!currentTake(s) || s.status === 'done' : true;
+    return `<span style="flex-grow:${Number(s.durationSec) || 1};${filled ? `background:${shades[i % shades.length]}` : ''}" class="${filled ? '' : 'empty'}"></span>`;
+  }).join('')}</div>`;
+}
+
 function homeView() {
   const cards = state.projects.map((p) => {
-    const pg = progress(p);
-    return `<article class="card project-card">
-      <button class="project-open" data-action="open" data-id="${p.id}">
-        <h3>${esc(p.name)}</h3>
-        <p class="muted">${esc([p.artist, p.song].filter(Boolean).join(' — ') || 'No artist yet')}</p>
-        <div class="bar"><span style="width:${pg.pct}%"></span></div>
-        <p class="small muted">${pg.done}/${pg.total} shots · updated ${timeAgo(p.updatedAt)}${p.offline ? ' · <b class="ok-text">Offline ready</b>' : ''}</p>
+    const filled = filledCount(p);
+    const badge = filled && filled === p.shots.length ? '<span class="badge">READY</span>'
+      : p.offline ? '<span class="badge">OFFLINE ✓</span>'
+        : !filled ? '<span class="badge dim">DRAFT</span>' : '';
+    return `<article class="pcard">
+      <button class="pcard-open" data-action="open" data-id="${p.id}">
+        <span class="pcard-head"><span><span class="display pcard-title">${esc(p.name)}</span>
+          <span class="pcard-sub">${esc([p.artist, p.song].filter(Boolean).join(' — ') || 'No artist yet')}</span></span>${badge}</span>
+        ${miniBars(p)}
+        <span class="mono-sub">${filled} OF ${p.shots.length} SHOT · ${formatTime(totalDuration(p), { tenths: false })} · ${esc(timeAgo(p.updatedAt).toUpperCase())}</span>
       </button>
-      <div class="row wrap">
-        <button class="btn sm" data-action="open" data-id="${p.id}">Continue</button>
-        <button class="btn sm ghost" data-action="duplicate" data-id="${p.id}">Duplicate</button>
-        <button class="btn sm ghost" data-action="home-export" data-id="${p.id}" data-export="backup" data-format="json">Download</button>
-        <button class="btn sm ghost" data-action="home-export" data-id="${p.id}" data-export="full" data-format="pdf">Share</button>
-        <button class="btn sm ghost danger" data-action="delete-project" data-id="${p.id}">Delete</button>
+      <div class="pcard-actions">
+        <button class="link-btn" data-action="duplicate" data-id="${p.id}">Duplicate</button>
+        <button class="link-btn" data-action="home-export" data-id="${p.id}" data-export="backup" data-format="json">Download</button>
+        <button class="link-btn" data-action="home-export" data-id="${p.id}" data-export="full" data-format="pdf">Share</button>
+        <button class="link-btn danger" data-action="delete-project" data-id="${p.id}">Delete</button>
       </div>
     </article>`;
   }).join('');
-  return `<header class="top">
-      <div class="brand"><img src="icons/icon.svg" alt="" width="32" height="32"><h1>ReaShoota</h1></div>
-      <div id="status" class="status"></div>
+  return `<div class="screen home">
+    <header class="home-head">
+      <div class="wordmark"><span class="rec-dot"></span><span class="display">REASHOOTA</span></div>
+      <span class="outline-pill">ON THIS PHONE</span>
     </header>
-    <main class="page">
-      <div class="row wrap">
-        <button class="btn primary" data-action="new-project">+ New project</button>
-        <button class="btn" data-action="import">Import backup</button>
-        ${state.projects.length ? '' : '<button class="btn ghost" data-action="demo">Try the demo project</button>'}
-      </div>
-      ${cards || '<p class="empty">No projects yet. Start one, or try the demo to see exports, storyboards and offline mode.</p>'}
-      ${accountCard()}
-    </main>`;
+    <div id="status" class="status"></div>
+    <button class="cta" data-action="new-project">${icon('plus')} NEW VIDEO</button>
+    ${state.projects.length ? '<p class="eyebrow">RECENT</p>' : ''}
+    ${cards || `<div class="empty-card"><p>No videos yet. Start one, or open the demo to see how the timeline, captions and exports work.</p><button class="btn" data-action="demo">Open the demo</button></div>`}
+    <div class="home-foot">
+      <button class="btn ghost" data-action="import">Import backup</button>
+      ${state.cloud ? '<button class="btn ghost" data-action="sync-now">Back up now</button>' : '<button class="btn ghost" data-action="sign-in">Sign in to back up</button>'}
+    </div>
+    ${state.cloud ? accountCard() : ''}
+  </div>`;
 }
 
 function accountCard() {
@@ -220,12 +253,12 @@ function projectView() {
   const tabs = TABS.map(([id, label]) => `<button role="tab" class="tab ${state.tab === id ? 'on' : ''}" aria-selected="${state.tab === id}" data-action="tab" data-tab="${id}">${label}</button>`).join('');
   const body = { shoot: shootTab, board: boardTab, direction: directionTab, checklist: checklistTab, media: mediaTab, export: exportTab }[state.tab]();
   return `<div class="sticky-head"><header class="top">
-      <button class="icon-btn" data-action="home" aria-label="All projects">‹</button>
+      <button class="icon-btn" data-action="go" data-view="timeline" aria-label="Back to timeline">${icon('back')}</button>
       <div class="title-block">
-        <h1>${esc(p.name)}</h1>
-        <p class="small muted">${pg.done}/${pg.total} shots · ${p.offline ? '<b class="ok-text">Offline ready</b>' : 'Saved on phone'}</p>
+        <h1 class="display">PLAN</h1>
+        <p class="mono-sub">${esc(p.name.toUpperCase())} · ${pg.done}/${pg.total} SHOTS${p.offline ? ' · OFFLINE READY' : ''}</p>
       </div>
-      <button class="icon-btn" data-action="edit-project" aria-label="Edit project">✎</button>
+      <button class="icon-btn" data-action="edit-project" aria-label="Edit project">${icon('edit')}</button>
     </header>
     <div id="status" class="status"></div>
     <nav class="tabs" role="tablist">${tabs}</nav></div>
@@ -495,7 +528,7 @@ async function readyAction(kind) {
 function busySheet(label) {
   const ctl = new AbortController();
   state.busy = { ctl };
-  openSheet(`<h2>${esc(label)}</h2><div class="bar big"><span id="busy-bar" style="width:4%"></span></div>
+  openSheet(`<h2>${esc(label)}</h2><div id="busy-preview"></div><div class="bar big"><span id="busy-bar" style="width:4%"></span></div>
     <p class="small muted" id="busy-note">Preparing…</p>
     <button class="btn ghost" data-action="cancel-busy">Cancel</button>`, { onClose: () => ctl.abort() });
   return {
@@ -506,10 +539,16 @@ function busySheet(label) {
 }
 
 async function runExport(project, exportId, format, opts = {}) {
-  const busy = busySheet(`Preparing ${exportLabel(exportId)}…`);
-  if (exportId === 'animatic') busy.note('Recording in real time — keep the screen on.');
+  const busy = busySheet(exportId === 'final' ? 'Making your video…' : `Preparing ${exportLabel(exportId)}…`);
+  if (exportId === 'animatic' || exportId === 'final') busy.note('Rendering in real time at 1080×1920 — keep the screen on.');
+  const onCanvas = (canvas) => {
+    const slot = $('#busy-preview');
+    if (!slot) return;
+    canvas.className = 'render-preview';
+    slot.replaceChildren(canvas);
+  };
   try {
-    const result = await produce(project, exportId, format, { onProgress: busy.progress, signal: busy.signal });
+    const result = await produce(project, exportId, format, { onProgress: busy.progress, onCanvas, signal: busy.signal });
     if (busy.signal.aborted) return;
     openReadySheet(result, { exportId, format, shareFirst: opts.shareFirst });
   } catch (err) {
@@ -647,12 +686,15 @@ function closeCountdown() {
 
 // ---------------------------------------------------------------- actions
 
-async function openProject(id, tab) {
+async function openProject(id, tab, view = 'timeline', sel = 0) {
   await flushSave();
   const p = await store.getProject(id);
   if (!p) return;
   state.project = p;
   state.tab = tab || 'shoot';
+  state.view = view || 'timeline';
+  state.sel = Math.min(sel || 0, Math.max(0, p.shots.length - 1));
+  media = null;
   render();
   window.scrollTo(0, 0);
   persistSession();
@@ -697,7 +739,12 @@ const handlers = {
     await store.putProject(p);
     openProject(p.id);
   },
-  'new-project'() { openSheet(projectForm(createProject(), true)); },
+  'new-project'() {
+    openSheet(`<form data-form="quick-new"><h2 class="display">NEW VIDEO</h2>
+      <label class="block">Song title <input name="song" placeholder="e.g. Ghost in the Taxi Rank" required></label>
+      <label class="block">Artist <input name="artist" placeholder="Who’s performing"></label>
+      <button class="btn primary big">NEXT: PICK A TEMPLATE</button></form>`);
+  },
   'edit-project'() { openSheet(projectForm(state.project, false)); },
   async duplicate(el) {
     const src = state.project?.id === el.dataset.id ? state.project : await store.getProject(el.dataset.id);
@@ -940,6 +987,742 @@ function timeAgo(iso) {
   return new Date(iso).toLocaleDateString();
 }
 
+// ---------------------------------------------------------------- studio (timeline, camera, song, captions)
+
+const ICONS = {
+  back: '<path d="M15 18l-6-6 6-6"/>',
+  plus: '<path d="M12 5v14"/><path d="M5 12h14"/>',
+  save: '<path d="M12 3v12"/><path d="M7 10l5 5 5-5"/><path d="M5 21h14"/>',
+  play: '<path d="M7 4l13 8-13 8z" fill="currentColor" stroke="none"/>',
+  pause: '<rect x="6" y="4" width="4" height="16" rx="1" fill="currentColor" stroke="none"/><rect x="14" y="4" width="4" height="16" rx="1" fill="currentColor" stroke="none"/>',
+  grid: '<rect x="3" y="3" width="7" height="7" rx="1.5"/><rect x="14" y="3" width="7" height="7" rx="1.5"/><rect x="3" y="14" width="7" height="7" rx="1.5"/><rect x="14" y="14" width="7" height="7" rx="1.5"/>',
+  photos: '<rect x="3" y="5" width="18" height="14" rx="2"/><circle cx="9" cy="11" r="2"/><path d="M21 16l-5-5-9 8"/>',
+  list: '<path d="M8 6h13"/><path d="M8 12h13"/><path d="M8 18h13"/><path d="M3 6h.01"/><path d="M3 12h.01"/><path d="M3 18h.01"/>',
+  music: '<path d="M9 18V5l12-2v13"/><circle cx="6" cy="18" r="3"/><circle cx="18" cy="16" r="3"/>',
+  captions: '<rect x="2" y="5" width="20" height="14" rx="2"/><path d="M7 15h4"/><path d="M15 15h2"/><path d="M7 11h2"/><path d="M13 11h4"/>',
+  edit: '<path d="M12 20h9"/><path d="M16.5 3.5a2.1 2.1 0 013 3L7 19l-4 1 1-4z"/>',
+  close: '<path d="M6 6l12 12"/><path d="M18 6L6 18"/>',
+  flip: '<path d="M3 7h13l-3-3"/><path d="M21 17H8l3 3"/>',
+  camera: '<rect x="3" y="6" width="13" height="12" rx="2"/><path d="M16 10l5-3v10l-5-3"/>',
+  spark: '<path d="M12 3l1.8 5.2L19 10l-5.2 1.8L12 17l-1.8-5.2L5 10l5.2-1.8z"/>',
+};
+function icon(name, size = 20) {
+  return `<svg width="${size}" height="${size}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${ICONS[name] || ''}</svg>`;
+}
+
+const SLOT_SHADES = ['#4b32d6', '#6c4dff', '#8f78ff', '#a996ff'];
+const label = (i) => `S${String(i + 1).padStart(2, '0')}`;
+
+// Media (take videos, frames, decoded song) is loaded once and reused until it changes.
+let media = null;
+let mediaKey = '';
+let player = null;
+function keyOf(p) {
+  return JSON.stringify([p.track?.assetId, p.shots.map((s) => [currentTake(s)?.assetId, s.frameAssetId])]);
+}
+async function ensureMedia() {
+  const p = state.project;
+  const k = keyOf(p);
+  if (!media || k !== mediaKey) {
+    media = await loadMedia(p);
+    mediaKey = k;
+  } else {
+    await loadCaptionFont(p.captions.font);
+  }
+  return media;
+}
+
+function stopPlayback() {
+  if (player?.playing) player.stop();
+  songPreview?.stop();
+  songPreview = null;
+}
+
+async function refreshMonitor() {
+  const canvas = $('#monitor');
+  if (!canvas) return;
+  const p = state.project;
+  await ensureMedia();
+  if (!$('#monitor') || state.project !== p) return;
+  player = new TimelinePlayer(p, media, {
+    canvas,
+    onTime: (t) => updatePlayhead(t),
+    onEnd: () => { setPlayIcon(false); updatePlayhead(selStart()); },
+  });
+  const slot = slotTimes(p)[state.sel];
+  if (!slot) { player.draw(0); return; }
+  // Show the moment in the slot where its caption is visible, if any.
+  let t = slot.start + Math.min(0.6, (slot.end - slot.start) / 2);
+  for (let x = slot.start; x < slot.end; x += 0.25) { if (captionAt(p, x)) { t = x + 0.2; break; } }
+  if (state.view === 'captions' && !captionAt(p, t)) t = slot.start;
+  player.draw(Math.min(t, slot.end - 0.01));
+}
+
+const selStart = () => slotTimes(state.project)[state.sel]?.start || 0;
+
+function updatePlayhead(t) {
+  const ph = $('#playhead');
+  if (ph) ph.style.transform = `translateX(${t * PX_PER_SEC}px)`;
+  const tc = $('#tc');
+  if (tc) tc.textContent = formatTime(t);
+}
+function setPlayIcon(on) {
+  const b = $('#play-btn');
+  if (b) { b.innerHTML = icon(on ? 'pause' : 'play', 16); b.setAttribute('aria-label', on ? 'Pause' : 'Play timeline'); }
+}
+// Scroll only the timeline strip (never the page) so the selected slot is centred.
+function scrollSlotIntoView() {
+  const wrap = $('#strip');
+  const el = $(`.slot[data-i="${state.sel}"]`);
+  if (!wrap || !el) return;
+  wrap.scrollLeft = Math.max(0, el.offsetLeft - wrap.clientWidth / 2 + el.offsetWidth / 2);
+}
+
+function waveBars(p, total) {
+  if (!p.track?.peaks?.length || !total) return '';
+  const count = Math.floor((total * PX_PER_SEC) / 5);
+  const off = songOffset(p);
+  const perSec = p.track.peaks.length / p.track.duration;
+  let out = '';
+  for (let i = 0; i < count; i += 1) {
+    const t = (i / count) * total;
+    const v = p.track.peaks[Math.min(p.track.peaks.length - 1, Math.floor((off + t) * perSec))] || 0;
+    out += `<i style="height:${4 + Math.round(v * 0.22)}px"></i>`;
+  }
+  return out;
+}
+
+function timelineView() {
+  const p = state.project;
+  const slots = slotTimes(p);
+  const total = totalDuration(p);
+  const filled = filledCount(p);
+  if (state.sel >= slots.length) state.sel = Math.max(0, slots.length - 1);
+  const cur = slots[state.sel];
+  const shot = cur?.shot;
+  const take = shot && currentTake(shot);
+  const c = shot?.camera || {};
+  const chips = shot ? [c.lens, c.move, c.fps && `${c.fps} fps`, shot.location].filter(Boolean) : [];
+
+  // Section labels: consecutive shots sharing a section name.
+  const groups = [];
+  for (const s of slots) {
+    const name = s.shot.section || '';
+    if (groups.length && groups.at(-1).name === name) groups.at(-1).dur += s.end - s.start;
+    else groups.push({ name, dur: s.end - s.start });
+  }
+  const hasSections = groups.some((g) => g.name);
+
+  const slotHtml = slots.map((s) => {
+    const t = currentTake(s.shot);
+    const on = s.index === state.sel;
+    const w = Math.max(28, (s.end - s.start) * PX_PER_SEC - 4);
+    return `<button class="slot ${t ? 'filled' : 'empty'} ${on ? 'on' : ''}" data-action="select-slot" data-i="${s.index}" style="width:${w}px;${t ? `background:${SLOT_SHADES[s.index % SLOT_SHADES.length]}` : ''}" aria-label="${label(s.index)} ${esc(s.shot.title)}${t ? ', filmed' : ', not filmed'}">
+      ${t?.thumbId ? `<img data-asset="${t.thumbId}" alt="">` : ''}
+      <span class="slot-l">${label(s.index)}${t ? ' ✓' : ''}</span><span class="slot-d">${(s.end - s.start).toFixed(1).replace(/\.0$/, '')}s</span>
+    </button>`;
+  }).join('');
+
+  const noShots = !slots.length;
+  return `<div class="screen tl">
+    <header class="topbar">
+      <button class="icon-btn" data-action="home" aria-label="All projects">${icon('back')}</button>
+      <div class="grow">
+        <h1 class="display title-1">${esc(p.name)}</h1>
+        <p class="mono-sub nowrap">${filled}/${slots.length} SHOT${p.artist ? ` · ${esc(p.artist.toUpperCase())}` : ''}${p.offline ? ' · OFFLINE ✓' : ''}</p>
+      </div>
+      <button class="icon-btn" data-action="go" data-view="plan" aria-label="Plan: shot list, board, direction, checklist">${icon('list')}</button>
+      <button class="btn primary sm" data-action="open-save">${icon('save', 18)} Save</button>
+    </header>
+    <div id="status" class="status"></div>
+
+    <section class="monitor">
+      <canvas id="monitor" width="540" height="960" aria-label="Preview"></canvas>
+      ${cur ? `<span class="tag ${take ? 'dark' : ''}">${label(cur.index)} · ${take ? `TAKE ${shot.take + 1} OF ${shot.takes.length}` : 'NEXT UP'}</span>
+      <span class="tc-chip">${formatTime(cur.start)}</span>` : ''}
+    </section>
+
+    ${shot ? `<section class="shot-info">
+      <div class="shot-title-row"><h2>${esc(shot.title)}</h2><span class="mono-sub">${shot.durationSec}s</span></div>
+      ${shot.description ? `<p class="shot-desc">${esc(shot.description)}</p>` : ''}
+      <div class="chips">${chips.map((x, i) => `<span class="chip t${i % 4}">${esc(x)}</span>`).join('')}
+        <button class="chip ghost" data-action="edit-shot" data-id="${shot.id}">${icon('edit', 14)} Edit</button>
+        ${shot.takes.length > 1 ? `<button class="chip ghost" data-action="next-take" data-id="${shot.id}">Use take ${(shot.take + 1) % shot.takes.length + 1}</button>` : ''}
+        <button class="chip ghost" data-action="regen-shot" data-id="${shot.id}">${icon('spark', 14)} New idea</button>
+      </div>
+    </section>` : `<section class="shot-info"><h2>Start with a template</h2><p class="shot-desc">Pick a layout of timed slots, add your song, then shoot straight into each slot.</p></section>`}
+
+    <nav class="tools" aria-label="Edit tools">
+      <button class="tool" data-action="go" data-view="song">${icon('music', 16)} ${p.track ? `${p.track.bpm ? `${p.track.bpm} BPM` : 'Song'}` : 'Add song'}</button>
+      <button class="tool" data-action="go" data-view="captions">${icon('captions', 16)} ${p.captions.enabled ? 'Captions on' : 'Captions'}</button>
+      <button class="tool" data-action="go" data-view="templates">${icon('grid', 16)} Templates</button>
+    </nav>
+
+    <section class="dock">
+      <div class="transport">
+        <span class="mono"><span id="tc">${formatTime(cur?.start || 0)}</span> <span class="muted">/ ${formatTime(total)}</span></span>
+        <button class="round" id="play-btn" data-action="play" aria-label="Play timeline" ${noShots ? 'disabled' : ''}>${icon('play', 16)}</button>
+      </div>
+      ${noShots ? '<button class="cta small" data-action="go" data-view="templates">PICK A TEMPLATE</button>' : `
+      <div class="strip-wrap" id="strip">
+        <div class="strip" style="width:${total * PX_PER_SEC + 24}px">
+          ${hasSections ? `<div class="sections">${groups.map((g) => `<span style="width:${g.dur * PX_PER_SEC}px">${esc(g.name.toUpperCase())}</span>`).join('')}</div>` : ''}
+          <div class="slots">${slotHtml}</div>
+          <div class="wave">${waveBars(p, total) || `<button class="wave-add" data-action="go" data-view="song">${icon('music', 14)} Add your song to cut on the beat</button>`}</div>
+          <div class="playhead" id="playhead" style="transform:translateX(${(cur?.start || 0) * PX_PER_SEC}px)"></div>
+        </div>
+      </div>`}
+      <div class="shoot-row">
+        <button class="side" data-action="go" data-view="templates"><span>${icon('grid', 22)}</span>Auto-fill</button>
+        <button class="shoot" data-action="open-camera" ${noShots ? 'disabled' : ''} aria-label="Shoot ${cur ? label(cur.index) : ''}"><span>SHOOT</span></button>
+        <button class="side" data-action="slot-from-photos" ${noShots ? 'disabled' : ''}><span>${icon('photos', 22)}</span>From Photos</button>
+      </div>
+    </section>
+  </div>`;
+}
+
+function subHeader(title, right = '') {
+  return `<header class="topbar">
+    <button class="icon-btn" data-action="go" data-view="timeline" aria-label="Back to timeline">${icon('back')}</button>
+    <h1 class="display grow title-2">${title}</h1>${right}
+  </header>`;
+}
+
+function songView() {
+  const p = state.project;
+  const song = p.track;
+  if (!song) {
+    return `<div class="screen sub">${subHeader('THE SONG')}
+      <div class="empty-card big">
+        <span class="empty-icon">${icon('music', 30)}</span>
+        <h2>Add your song</h2>
+        <p>ReaShoota finds the beat so every cut lands on it, plays the track while you film for lip-sync, and puts the song on your finished video.</p>
+        <button class="btn primary big" data-action="add-song">CHOOSE SONG FILE</button>
+        <p class="hint">MP3, M4A or WAV — from Files, iCloud Drive or a voice memo.</p>
+      </div>
+      ${lyricsBlock(p)}
+    </div>`;
+  }
+  const { start, end } = song.range;
+  const bars = song.peaks.filter((_, i) => i % Math.ceil(song.peaks.length / 110) === 0);
+  const wave = bars.map((v, i) => {
+    const t = (i / bars.length) * song.duration;
+    return `<i class="${t >= start && t < end ? 'in' : ''}" style="height:${5 + Math.round(v * 0.34)}px"></i>`;
+  }).join('');
+  const len = end - start;
+  const modes = [
+    ['full', 'Full', formatTime(song.duration, { tenths: false })],
+    ['best30', 'Best 30s', '0:30'],
+    ['hook15', 'Hook', '0:15'],
+    ['custom', 'Custom', formatTime(len, { tenths: false })],
+  ];
+  const mode = song.mode || 'full';
+  return `<div class="screen sub">${subHeader('THE SONG', '<button class="btn ghost sm" data-action="add-song">Replace</button>')}
+    <section class="card song-card">
+      <div class="row">
+        <button class="round big" id="song-play" data-action="song-preview" aria-label="Play song">${icon('play', 18)}</button>
+        <div class="grow"><b class="song-name">${esc(song.name)}</b>
+          <p class="mono-sub">${esc((p.artist || '').toUpperCase())}${p.artist ? ' · ' : ''}${formatTime(song.duration, { tenths: false })}${song.bpm ? ` · ${song.bpm} BPM FOUND` : ''}</p></div>
+      </div>
+      <div class="song-wave">${wave}</div>
+      <p class="mono-sub">USING ${formatTime(start)} – ${formatTime(end)} (${len.toFixed(1)}s)</p>
+    </section>
+    <p class="eyebrow">USE FOR THIS VIDEO</p>
+    <div class="grid4">${modes.map(([id, l, d]) => `<button class="pick ${mode === id ? 'on' : ''}" data-action="song-range" data-mode="${id}">${l}<br><small>${d}</small></button>`).join('')}</div>
+    ${mode === 'custom' ? `<div class="card range">
+      <label>Start <input type="range" min="0" max="${song.duration.toFixed(1)}" step="0.5" value="${start}" data-range="start"> <span class="mono" id="r-start">${formatTime(start)}</span></label>
+      <label>End <input type="range" min="0" max="${song.duration.toFixed(1)}" step="0.5" value="${end}" data-range="end"> <span class="mono" id="r-end">${formatTime(end)}</span></label>
+    </div>` : ''}
+    ${lyricsBlock(p)}
+    <div class="bottom-actions">
+      <button class="btn" data-action="lyric-sync" ${p.lyrics.length ? '' : 'disabled'}>Tap to sync</button>
+      <button class="btn primary big grow" data-action="beat-slots" ${song.bpm ? '' : 'disabled'}>BUILD SLOTS ON THE BEAT</button>
+    </div>
+  </div>`;
+}
+
+function lyricsBlock(p) {
+  const times = p.lyricTimes || [];
+  const timed = p.lyrics.filter((_, i) => Number.isFinite(times[i])).length;
+  return `<div class="row between"><p class="eyebrow">LYRICS${p.lyrics.length ? ` · ${timed} OF ${p.lyrics.length} TIMED` : ''}</p>
+      <button class="link-btn" data-action="edit-lyrics">${p.lyrics.length ? 'Edit' : 'Paste lyrics'}</button></div>
+    <div class="card lyric-list">${p.lyrics.map((l, i) => `<div class="lyric"><span class="mono">${Number.isFinite(times[i]) ? formatTime(times[i], { tenths: false }) : '--:--'}</span><span>${esc(l)}</span></div>`).join('')
+      || '<p class="muted">Paste your lyrics — they become captions and tell each shot what line it covers.</p>'}</div>`;
+}
+
+function captionsView() {
+  const p = state.project;
+  const cs = p.captions;
+  return `<div class="screen sub">${subHeader('CAPTIONS', '<button class="btn primary sm" data-action="go" data-view="timeline">Done</button>')}
+    <section class="monitor cap-monitor"><canvas id="monitor" width="540" height="960" aria-label="Caption preview"></canvas>
+      <span class="tc-chip">${label(state.sel)}</span></section>
+    <div class="seg">
+      <button class="${cs.source !== 'speech' ? 'on' : ''}" data-action="cap-source" data-v="lyrics">Song lyrics</button>
+      <button class="${cs.source === 'speech' ? 'on' : ''}" data-action="cap-source" data-v="speech">Speech in clips</button>
+    </div>
+    <p class="hint-line">${cs.source === 'speech'
+    ? 'Transcribing speech needs the ReaShoota server, which isn’t set up yet — lyrics captions work now.'
+    : p.lyrics.length ? `From your lyrics, ${(p.lyricTimes || []).some(Number.isFinite) ? 'timed to the song' : 'timed to each slot (tap-to-sync on the Song screen for exact timing)'}. Works offline.` : 'Add lyrics on the Song screen, or a lyric to each shot.'}</p>
+    <p class="eyebrow">STYLE</p>
+    <div class="grid4">${CAPTION_STYLES.map((st, i) => `<button class="pick style-pick s${i} ${cs.style === st.id ? 'on' : ''}" data-action="cap-style" data-v="${st.id}"><b>Aa</b><small>${st.label}</small></button>`).join('')}</div>
+    <p class="eyebrow">FONT</p>
+    <div class="grid3">${CAPTION_FONTS.map((f) => `<button class="pick font-pick ${cs.font === f.id ? 'on' : ''}" data-action="cap-font" data-v="${esc(f.id)}" style="font-family:${esc(f.css)}">${f.label}</button>`).join('')}</div>
+    <div class="bottom-actions">
+      <button class="btn" data-action="edit-lyrics">Edit words</button>
+      <button class="btn primary big grow" data-action="cap-toggle">${cs.enabled ? 'TURN CAPTIONS OFF' : `CAPTION ALL ${p.shots.length} SLOTS`}</button>
+    </div>
+  </div>`;
+}
+
+function templatesView() {
+  const p = state.project;
+  const pastel = ['#8f78ff', '#b6a8ff', '#cfc5ff', '#a996ff', '#dcd4ff'];
+  const cards = TEMPLATES.map((t) => {
+    const on = state.tpl === t.id;
+    return `<button class="tpl ${on ? 'on' : ''}" data-action="pick-tpl" data-id="${t.id}">
+      <span class="tpl-head"><b>${t.name}</b><span class="mono-sub">${t.meta.toUpperCase()}</span></span>
+      <span class="fx-row">${(t.fx || []).map((x) => `<span class="fx">${FX_LABELS[x]}</span>`).join('')}</span>
+      <span class="tpl-bars">${t.slots.map((d, i) => `<i style="flex-grow:${d};background:${on ? (i % 2 ? '#a996ff' : '#6c4dff') : pastel[i % pastel.length]}"></i>`).join('')}</span>
+    </button>`;
+  }).join('');
+  const tpl = TEMPLATES.find((t) => t.id === state.tpl);
+  return `<div class="screen sub">${subHeader('PICK A<br>TEMPLATE')}
+    <p class="lead-sm">Slots are timed to the song${p.track?.bpm ? ` (${p.track.bpm} BPM)` : ''}. Shoot into each one, or drop in clips you already have.</p>
+    <div class="stack">${cards}</div>
+    <button class="card info-row" data-action="auto-fill">
+      <span class="info-icon">${icon('plus', 22)}</span>
+      <span><b>Already filmed?</b> Pick clips from Photos — they fill the empty slots in order, trimmed to fit.</span>
+    </button>
+    <div class="bottom-actions"><button class="btn primary big grow" data-action="use-tpl">USE “${esc(tpl.name.toUpperCase())}”</button></div>
+  </div>`;
+}
+
+// ---- save sheet (the "Your cut is ready" design) ----
+
+function openSaveSheet() {
+  const p = state.project;
+  const filled = filledCount(p);
+  const firstThumb = p.shots.map((s) => currentTake(s)?.thumbId).find(Boolean);
+  openSheet(`<div class="cut-head">
+      <div class="cut-thumb">${firstThumb ? `<img data-asset="${firstThumb}" alt="">` : ''}${icon('play', 26)}</div>
+      <div><h2 class="display">${filled ? 'YOUR CUT' : 'NOTHING<br>FILMED YET'}</h2>
+        <p class="mono-sub">${formatTime(totalDuration(p), { tenths: false })} · 1080×1920 · ${filled}/${p.shots.length} SLOTS</p>
+        <p class="small muted">${p.track ? 'Song synced' : 'No song yet'} · captions ${p.captions.enabled ? 'on' : 'off'}</p></div>
+    </div>
+    <button class="btn primary big" data-action="make-video" ${filled ? '' : 'disabled'}>${icon('save', 18)} MAKE VIDEO & SAVE TO PHOTOS</button>
+    <p class="hint">Rendering plays your cut once in real time — keep the screen on. Then choose <b>Save Video</b> in the share sheet.${filled && filled < p.shots.length ? ` <b>${p.shots.length - filled} unfilmed slot${p.shots.length - filled === 1 ? '' : 's'}</b> will reuse your nearest clip.` : ''}</p>
+    <p class="eyebrow">ALSO SAVE</p>
+    <div class="card rows">
+      ${[
+    ['Shoot pack', 'PDF · shots, camera, locations, checklist', 'Save', 'quick-export', 'shoot', 'pdf'],
+    ['Storyboard', 'PDF or images to Photos', 'Save', 'quick-export', 'storyboard', 'pdf'],
+    ['Shot list', 'Text for WhatsApp or Notes', 'Copy', 'copy', 'shotlist', ''],
+    ['Every clip', `${p.shots.reduce((n, s) => n + s.takes.length, 0)} takes, original quality`, 'Save', 'quick-export', 'clips', 'video'],
+    ['Storyboard animatic', '9:16 video of your frames', 'Make', 'quick-export', 'animatic', 'video'],
+    ['Everything else', 'Deck, direction, lyrics map, backup…', 'Open', 'all-exports', '', ''],
+  ].map(([n, m, a, act, id, fmt]) => `<div class="row-item"><div class="grow"><b>${n}</b><small>${m}</small></div>
+        <button class="btn sm ghost" data-action="${act}" data-export="${id}" data-kind="${id}" data-format="${fmt}">${a}</button></div>`).join('')}
+    </div>
+    <button class="btn ghost" data-action="close-sheet">Close</button>`);
+}
+
+// ---- takes ----
+
+async function storeTake(shot, blob, { mime, name, dur } = {}) {
+  const id = uid('take');
+  const type = mime || blob.type || 'video/mp4';
+  let thumbId = null;
+  let duration = dur || 0;
+  try {
+    const th = await videoThumb(blob);
+    thumbId = uid('thumb');
+    duration = duration || th.duration;
+    await store.putAsset({ id: thumbId, kind: 'thumb', name: `${id}.jpg`, mime: 'image/jpeg', blob: th.blob, createdAt: new Date().toISOString() });
+  } catch { thumbId = null; }
+  await store.putAsset({ id, kind: 'take', name: name || `${id}.${type.includes('mp4') ? 'mp4' : type.includes('quicktime') ? 'mov' : 'webm'}`, mime: type, blob, createdAt: new Date().toISOString() });
+  shot.takes.push({ assetId: id, thumbId, at: new Date().toISOString(), dur: duration });
+  shot.take = shot.takes.length - 1;
+  shot.status = 'done';
+  shot.completedAt = new Date().toISOString();
+  return id;
+}
+
+function nextEmptySlot(from = 0) {
+  const shots = state.project.shots;
+  for (let k = 1; k <= shots.length; k += 1) {
+    const i = (from + k) % shots.length;
+    if (!shots[i].takes.length) return i;
+  }
+  return Math.min(from + 1, shots.length - 1);
+}
+
+// ---- camera overlay ----
+
+const cam = { stream: null, facing: 'environment', busy: false, abort: null };
+
+function camOverlayHtml() {
+  const p = state.project;
+  const slots = slotTimes(p);
+  const s = slots[state.sel];
+  const shot = s.shot;
+  const st = p.shootSettings;
+  return `<video class="cam-feed" id="cam-feed" playsinline muted autoplay></video>
+    <div class="cam-grid"><i></i><i></i><i></i><i></i></div>
+    <div class="cam-top">
+      <button class="icon-btn glass" data-action="cam-close" aria-label="Close camera">${icon('close')}</button>
+      <div class="glass cam-info"><span class="mono-tag">${label(s.index)} · SLOT ${(s.end - s.start).toFixed(1)}s · TAKE ${shot.takes.length + 1}</span><b>${esc(shot.title)}</b></div>
+    </div>
+    <div class="cam-count" id="cam-count" aria-live="assertive"></div>
+    <div class="glass cam-dir">
+      ${shot.description ? `<p>${esc(shot.description)}</p>` : ''}
+      ${shot.lyric ? `<p class="cam-lyric">“${esc(shot.lyric)}”</p>` : ''}
+      <p class="mono-tag dim">${esc([shot.camera.lens || st.lens, shot.camera.move, `${shot.camera.fps || st.fps} FPS`].filter(Boolean).join(' · ').toUpperCase())}</p>
+    </div>
+    <div class="cam-bottom">
+      <div class="cam-progress">${slots.map((x) => `<i style="flex-grow:${x.end - x.start}" class="${x.index === s.index ? 'cur' : currentTake(x.shot) ? 'done' : ''}">${x.index === s.index ? '<b id="cam-fill"></b>' : ''}</i>`).join('')}</div>
+      <div class="cam-controls">
+        <button class="cam-side" data-action="cam-native">iPhone<br>camera</button>
+        <button class="rec" id="rec-btn" data-action="cam-record" aria-label="Record ${label(s.index)}"><span></span></button>
+        <button class="cam-side" data-action="cam-flip" aria-label="Switch camera">${icon('flip', 22)}</button>
+      </div>
+    </div>`;
+}
+
+async function openCameraView() {
+  let el = $('.cam');
+  if (!el) {
+    el = document.createElement('div');
+    el.className = 'cam';
+    el.setAttribute('role', 'dialog');
+    el.setAttribute('aria-label', 'Camera');
+    document.body.appendChild(el);
+    document.body.classList.add('sheet-open');
+  }
+  el.innerHTML = camOverlayHtml();
+  if (!cameraSupported()) {
+    $('#cam-count').innerHTML = '<small>Live camera isn’t available here — use iPhone camera.</small>';
+    return;
+  }
+  try {
+    if (!cam.stream) cam.stream = await openCamera(cam.facing);
+    const v = $('#cam-feed');
+    v.srcObject = cam.stream;
+    v.classList.toggle('mirror', cam.facing === 'user');
+    await v.play().catch(() => {});
+  } catch (err) {
+    $('#cam-count').innerHTML = `<small>Camera blocked (${esc(err.name || err.message)}). Allow camera access in Settings › Safari, or use iPhone camera.</small>`;
+  }
+}
+
+function closeCameraView() {
+  cam.abort?.abort();
+  closeCamera(cam.stream);
+  cam.stream = null;
+  $('.cam')?.remove();
+  document.body.classList.remove('sheet-open');
+  commit();
+}
+
+async function camRecord() {
+  if (cam.busy) { cam.abort?.abort(); return; }
+  if (!cam.stream) { toast('Camera isn’t on — use iPhone camera instead', 'error'); return; }
+  const p = state.project;
+  const slot = slotTimes(p)[state.sel];
+  const shot = slot.shot;
+  // Audio must be unlocked inside this tap (iOS).
+  unlockAudio();
+  cam.busy = true;
+  cam.abort = new AbortController();
+  const btn = $('#rec-btn');
+  btn.classList.add('armed');
+  const countEl = $('#cam-count');
+  const n = Number(p.shootSettings.countdownSec) || 0;
+  const m = await ensureMedia();
+  // Song plays through the countdown so the artist can come in on time.
+  let song = null;
+  if (m.song) song = playSong(m.song, Math.max(0, songOffset(p) + slot.start - n), songOffset(p) + slot.end);
+  try {
+    for (let i = n; i > 0; i -= 1) {
+      if (cam.abort.signal.aborted) throw new DOMException('Cancelled', 'AbortError');
+      countEl.textContent = i;
+      navigator.vibrate?.(40);
+      await new Promise((r) => { setTimeout(r, 1000); });
+    }
+    if (cam.abort.signal.aborted) throw new DOMException('Cancelled', 'AbortError');
+    countEl.textContent = '';
+    btn.classList.add('rolling');
+    const dur = slot.end - slot.start;
+    const fill = $('#cam-fill');
+    const res = await recordTake(cam.stream, dur, {
+      signal: cam.abort.signal,
+      onTick: (el) => { if (fill) fill.style.width = `${(el / dur) * 100}%`; },
+    });
+    if (cam.abort.signal.aborted) throw new DOMException('Cancelled', 'AbortError');
+    countEl.innerHTML = '<small>Saving take…</small>';
+    await storeTake(shot, res.blob, { mime: res.type, dur: res.dur });
+    commit({ render: false });
+    toast(`Take saved to ${label(state.sel)}`, 'ok');
+    state.sel = nextEmptySlot(state.sel);
+    persistSession();
+    openCameraView();
+  } catch (err) {
+    if (err.name !== 'AbortError') toast(err.message, 'error');
+    else if (countEl) countEl.textContent = '';
+    btn?.classList.remove('armed', 'rolling');
+  } finally {
+    song?.stop();
+    cam.busy = false;
+  }
+}
+
+let songPreview = null;
+let syncState = null;
+
+// ---- handlers ----
+
+Object.assign(handlers, {
+  go(el) {
+    state.view = el.dataset.view;
+    render();
+    window.scrollTo(0, 0);
+    persistSession();
+  },
+  'select-slot'(el) {
+    state.sel = Number(el.dataset.i);
+    render();
+    persistSession();
+  },
+  play() {
+    if (player?.playing) { player.stop(); setPlayIcon(false); return; }
+    unlockAudio();
+    setPlayIcon(true);
+    ensureMedia().then(() => {
+      if (!player) return;
+      player.media = media;
+      player.play(selStart());
+    });
+  },
+  'open-save': openSaveSheet,
+  'make-video'() {
+    unlockAudio();
+    runExport(state.project, 'final', 'video');
+  },
+  'all-exports'() { closeSheet(); state.view = 'plan'; state.tab = 'export'; render(); },
+  'open-camera'() {
+    unlockAudio();
+    openCameraView();
+  },
+  'cam-close': closeCameraView,
+  'cam-record': camRecord,
+  async 'cam-flip'() {
+    if (cam.busy) return;
+    cam.facing = cam.facing === 'environment' ? 'user' : 'environment';
+    closeCamera(cam.stream);
+    cam.stream = null;
+    openCameraView();
+  },
+  async 'cam-native'() {
+    if (cam.busy) return;
+    const [file] = await pickFile('video/*', { capture: 'environment' });
+    if (!file) return;
+    const shot = state.project.shots[state.sel];
+    await storeTake(shot, file, { name: file.name });
+    commit({ render: false });
+    toast(`Take saved to ${label(state.sel)}`, 'ok');
+    state.sel = nextEmptySlot(state.sel);
+    openCameraView();
+  },
+  async 'slot-from-photos'() {
+    const [file] = await pickFile('video/*');
+    if (!file) return;
+    const busy = busySheet('Adding clip…');
+    const shot = state.project.shots[state.sel];
+    await storeTake(shot, file, { name: file.name });
+    closeSheet();
+    busy.progress(1);
+    commit();
+    toast(`Clip added to ${label(state.sel)}`, 'ok');
+  },
+  'next-take'(el) {
+    const s = findShot(state.project, el.dataset.id);
+    s.take = (s.take + 1) % s.takes.length;
+    commit();
+  },
+  'pick-tpl'(el) { state.tpl = el.dataset.id; render(); },
+  'use-tpl'() {
+    const p = state.project;
+    const filled = filledCount(p);
+    if (filled && !window.confirm(`Replace your ${p.shots.length} slots? The ${filled} filmed take${filled === 1 ? '' : 's'} will be removed from the timeline.`)) return;
+    applyTemplate(p, state.tpl);
+    state.sel = 0;
+    state.view = 'timeline';
+    commit();
+    toast(p.track?.bpm ? `Slots snapped to ${p.track.bpm} BPM` : 'Template ready — add your song to cut on the beat', 'ok');
+  },
+  async 'auto-fill'() {
+    const files = await pickFile('video/*', { multiple: true });
+    if (!files.length) return;
+    const p = state.project;
+    if (!p.shots.length) applyTemplate(p, state.tpl);
+    const busy = busySheet(`Adding ${files.length} clip${files.length === 1 ? '' : 's'}…`);
+    const targets = autoFillTargets(p, files.length);
+    for (let i = 0; i < files.length; i += 1) {
+      await storeTake(p.shots[targets[i]], files[i], { name: files[i].name });
+      busy.progress((i + 1) / files.length);
+    }
+    closeSheet();
+    state.sel = targets[0];
+    state.view = 'timeline';
+    commit();
+    toast(`${files.length} clip${files.length === 1 ? '' : 's'} dropped into slots`, 'ok');
+  },
+  async 'add-song'() {
+    const [file] = await pickFile('audio/*,.mp3,.m4a,.wav,.aac');
+    if (!file) return;
+    const busy = busySheet('Reading your song…');
+    busy.note('Finding the beat and drawing the waveform.');
+    try {
+      const id = uid('song');
+      await store.putAsset({ id, kind: 'song', name: file.name, mime: file.type || 'audio/mpeg', blob: file, createdAt: new Date().toISOString() });
+      const buf = await decodeSong(file, id);
+      busy.progress(0.6);
+      const a = analyse(buf);
+      const p = state.project;
+      p.assets.push({ id, kind: 'song', name: file.name, mime: file.type || 'audio/mpeg', size: file.size, createdAt: new Date().toISOString() });
+      const best = a.duration > 45 ? loudestWindow(a.peaks, a.duration, 30) : 0;
+      p.track = {
+        assetId: id, name: file.name.replace(/\.[^.]+$/, ''), duration: a.duration, bpm: a.bpm, peaks: a.peaks,
+        mode: a.duration > 45 ? 'best30' : 'full',
+        range: a.duration > 45 ? { start: best, end: Math.min(a.duration, best + 30) } : { start: 0, end: a.duration },
+      };
+      closeSheet();
+      commit();
+      toast(a.bpm ? `${a.bpm} BPM found` : 'Song added', 'ok');
+    } catch (err) {
+      closeSheet();
+      toast(`Couldn’t read that file (${err.message}). Try an MP3 or M4A.`, 'error');
+    }
+  },
+  'song-range'(el) {
+    const s = state.project.track;
+    const mode = el.dataset.mode;
+    s.mode = mode;
+    if (mode === 'full') s.range = { start: 0, end: s.duration };
+    if (mode === 'best30' || mode === 'hook15') {
+      const len = mode === 'best30' ? 30 : 15;
+      const st = loudestWindow(s.peaks, s.duration, len);
+      s.range = { start: st, end: Math.min(s.duration, st + len) };
+    }
+    commit();
+  },
+  async 'song-preview'() {
+    if (songPreview) { songPreview.stop(); songPreview = null; $('#song-play').innerHTML = icon('play', 18); return; }
+    unlockAudio();
+    const p = state.project;
+    const a = await store.getAsset(p.track.assetId);
+    const buf = await decodeSong(a.blob, a.id);
+    songPreview = playSong(buf, p.track.range.start, p.track.range.end);
+    songPreview.onended = () => { songPreview = null; const b = $('#song-play'); if (b) b.innerHTML = icon('play', 18); };
+    $('#song-play').innerHTML = icon('pause', 18);
+  },
+  'beat-slots'() {
+    buildBeatSlots(state.project);
+    state.view = 'timeline';
+    commit();
+    toast(`${state.project.shots.length} slots cut on the beat`, 'ok');
+  },
+  'edit-lyrics'() {
+    const p = state.project;
+    openSheet(`<form data-form="lyrics"><h2 class="display">LYRICS</h2>
+      <p class="small muted">One line per line. Timing and shot links update automatically.</p>
+      <textarea name="lyrics" rows="12">${esc(p.lyrics.join('\n'))}</textarea>
+      <button class="btn primary big">SAVE LYRICS</button></form>`);
+  },
+  async 'lyric-sync'() {
+    const p = state.project;
+    unlockAudio();
+    const a = p.track && await store.getAsset(p.track.assetId);
+    if (!a) { toast('Add the song first', 'error'); return; }
+    const buf = await decodeSong(a.blob, a.id);
+    // Start a little before the used range so the first line can be caught.
+    const from = Math.max(0, p.track.range.start - 4);
+    syncState = { i: 0, times: [], from, handle: playSong(buf, from, p.track.duration) };
+    const ac = audioContext();
+    syncState.clock = () => from + (ac.currentTime - syncState.handle.startAt);
+    openSheet(`<div class="sync"><p class="eyebrow">TAP WHEN EACH LINE STARTS</p>
+      <p class="sync-line" id="sync-line">${esc(p.lyrics[0])}</p>
+      <p class="small muted" id="sync-next">Next: ${esc(p.lyrics[1] || '—')}</p>
+      <button class="sync-tap" data-action="sync-tap">TAP</button>
+      <button class="btn ghost" data-action="sync-stop">Stop</button></div>`, { onClose: () => { syncState?.handle.stop(); syncState = null; } });
+  },
+  'sync-tap'() {
+    const p = state.project;
+    if (!syncState) return;
+    syncState.times[syncState.i] = Math.round(syncState.clock() * 10) / 10;
+    syncState.i += 1;
+    navigator.vibrate?.(20);
+    if (syncState.i >= p.lyrics.length) { handlers['sync-stop'](); return; }
+    $('#sync-line').textContent = p.lyrics[syncState.i];
+    $('#sync-next').textContent = `Next: ${p.lyrics[syncState.i + 1] || '—'}`;
+  },
+  'sync-stop'() {
+    const p = state.project;
+    if (syncState?.times.length) {
+      p.lyricTimes = p.lyrics.map((_, i) => (syncState.times[i] ?? p.lyricTimes[i] ?? null));
+      toast(`${syncState.times.length} line${syncState.times.length === 1 ? '' : 's'} timed`, 'ok');
+    }
+    closeSheet();
+    commit();
+  },
+  'cap-source'(el) { state.project.captions.source = el.dataset.v; commit(); },
+  'cap-style'(el) { state.project.captions.style = el.dataset.v; commit(); },
+  'cap-font'(el) { state.project.captions.font = el.dataset.v; commit(); },
+  'cap-toggle'() {
+    const c = state.project.captions;
+    c.enabled = !c.enabled;
+    if (c.enabled) { state.view = 'timeline'; toast('Captions will be burned into your video', 'ok'); }
+    commit();
+  },
+});
+
+Object.assign(forms, {
+  async 'quick-new'(form) {
+    const f = new FormData(form);
+    const song = String(f.get('song') || '').trim();
+    const p = createProject({ name: song || 'Untitled video', song, artist: String(f.get('artist') || '').trim() });
+    await store.putProject(p);
+    closeSheet();
+    await openProject(p.id, 'shoot', 'templates');
+  },
+  lyrics(form) {
+    const p = state.project;
+    const next = lines(new FormData(form).get('lyrics'));
+    // Keep timing for lines that didn't change.
+    p.lyricTimes = next.map((l) => {
+      const i = p.lyrics.indexOf(l);
+      return i >= 0 ? p.lyricTimes[i] ?? null : null;
+    });
+    p.lyrics = next;
+    closeSheet();
+    commit();
+  },
+});
+
+document.addEventListener('input', (e) => {
+  const el = e.target;
+  if (!el.dataset.range || !state.project?.track) return;
+  const r = state.project.track.range;
+  const v = Number(el.value);
+  if (el.dataset.range === 'start') r.start = Math.min(v, r.end - 1);
+  else r.end = Math.max(v, r.start + 1);
+  const a = $('#r-start');
+  const b = $('#r-end');
+  if (a) a.textContent = formatTime(r.start);
+  if (b) b.textContent = formatTime(r.end);
+  commit({ render: false });
+});
+document.addEventListener('change', (e) => { if (e.target.dataset?.range) render(); });
+
 // ---------------------------------------------------------------- wiring
 
 document.addEventListener('click', (e) => {
@@ -992,6 +1775,7 @@ document.addEventListener('toggle', (e) => {
 
 document.addEventListener('keydown', (e) => {
   if (e.key === 'Escape') { closeSheet(); closeCountdown(); }
+  if (e.key === ' ' && state.view === 'timeline' && !e.target.closest('input,textarea,select,button')) { e.preventDefault(); handlers.play(); }
 });
 
 // Save immediately whenever the app is backgrounded, closed or the screen locks.
@@ -1012,7 +1796,7 @@ async function boot() {
     state.projects = await store.listProjects();
     const session = await loadSession();
     if (session?.projectId && await store.getProject(session.projectId)) {
-      await openProject(session.projectId, session.tab);
+      await openProject(session.projectId, session.tab, session.view, session.sel);
       if (session.scrollY) requestAnimationFrame(() => window.scrollTo(0, session.scrollY));
     } else {
       render();

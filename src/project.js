@@ -41,8 +41,17 @@ export function createShot(partial = {}) {
     completedAt: partial.completedAt || null,
     notes: partial.notes || '',
     history: Array.isArray(partial.history) ? partial.history.slice(-5) : [],
+    section: partial.section || '',
+    fx: Array.isArray(partial.fx) ? [...partial.fx] : [], // edit effects: punch | pulse | flash
+    // Filmed takes for this slot; `take` is the index of the one used in the edit.
+    takes: Array.isArray(partial.takes) ? partial.takes.map((t) => ({
+      assetId: t.assetId, thumbId: t.thumbId || null, at: t.at || new Date().toISOString(), dur: Number(t.dur) || 0,
+    })) : [],
+    take: Number.isInteger(partial.take) ? partial.take : 0,
   };
 }
+
+export const DEFAULT_CAPTIONS = { enabled: true, style: 'pop', font: 'Anton', source: 'lyrics' };
 
 export function createProject(partial = {}) {
   const t = now();
@@ -80,6 +89,11 @@ export function createProject(partial = {}) {
     notes: partial.notes || '',
     offline: partial.offline || null, // { at: ISO, bytes } once "Make available offline" ran
     cloud: partial.cloud || null, // { syncedAt, remoteVersion }
+    // The song audio: { assetId, name, duration, bpm, peaks: number[0..100], range: { start, end } }
+    track: partial.track ? { ...partial.track, range: { start: 0, end: partial.track.duration || 0, ...(partial.track.range || {}) } } : null,
+    // Seconds into the song where each lyric line starts (parallel to `lyrics`); null = not synced.
+    lyricTimes: Array.isArray(partial.lyricTimes) ? [...partial.lyricTimes] : [],
+    captions: { ...DEFAULT_CAPTIONS, ...(partial.captions || {}) },
   };
   return p;
 }
@@ -110,6 +124,11 @@ export function setShotDone(project, shotId, done) {
   return shot;
 }
 
+export function currentTake(shot) {
+  if (!shot?.takes?.length) return null;
+  return shot.takes[Math.min(shot.take || 0, shot.takes.length - 1)];
+}
+
 export function progress(project) {
   const total = project.shots.length;
   const done = project.shots.filter((s) => s.status === 'done').length;
@@ -119,7 +138,14 @@ export function progress(project) {
 // Every asset id referenced anywhere in the project.
 export function referencedAssetIds(project) {
   const ids = new Set(project.assets.map((a) => a.id));
-  for (const s of project.shots) if (s.frameAssetId) ids.add(s.frameAssetId);
+  for (const s of project.shots) {
+    if (s.frameAssetId) ids.add(s.frameAssetId);
+    for (const t of s.takes || []) {
+      if (t.assetId) ids.add(t.assetId);
+      if (t.thumbId) ids.add(t.thumbId);
+    }
+  }
+  if (project.track?.assetId) ids.add(project.track.assetId);
   return ids;
 }
 

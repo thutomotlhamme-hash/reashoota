@@ -24,6 +24,19 @@ const SHELL = [
   './src/offline.js',
   './src/cloud.js',
   './src/exports.js',
+  './src/timeline.js',
+  './src/audio.js',
+  './src/render.js',
+  './src/camera.js',
+  './src/captions.js',
+  './fonts/fonts.css',
+  './fonts/Anton-400.woff2',
+  './fonts/ArchivoBlack-400.woff2',
+  './fonts/BebasNeue-400.woff2',
+  './fonts/InstrumentSans.woff2',
+  './fonts/InstrumentSerif-400.woff2',
+  './fonts/JetBrainsMono.woff2',
+  './fonts/PermanentMarker-400.woff2',
 ];
 
 self.addEventListener('install', (event) => {

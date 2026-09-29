@@ -40,7 +40,10 @@ function makeCanvas(w, h) {
   return c;
 }
 
-const dims = (img) => ({ w: img.width || img.naturalWidth, h: img.height || img.naturalHeight });
+const dims = (img) => ({
+  w: img.videoWidth || img.naturalWidth || img.width,
+  h: img.videoHeight || img.naturalHeight || img.height,
+});
 
 export function drawCover(ctx, img, x, y, w, h) {
   const { w: iw, h: ih } = dims(img);

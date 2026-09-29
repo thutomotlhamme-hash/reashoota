@@ -7,7 +7,7 @@ import { join } from 'node:path';
 
 const root = new URL('..', import.meta.url).pathname;
 const dist = join(root, 'dist');
-const ENTRIES = ['index.html', 'styles.css', 'manifest.webmanifest', 'sw.js', 'icons', 'src'];
+const ENTRIES = ['index.html', 'styles.css', 'manifest.webmanifest', 'sw.js', 'icons', 'src', 'fonts'];
 
 async function files(dir) {
   const out = [];
@@ -32,7 +32,7 @@ const sw = await readFile(join(root, 'sw.js'), 'utf8');
 const shell = [...sw.matchAll(/'\.\/([^']+)'/g)].map((m) => m[1]).filter((p) => p !== 'sw.js');
 const missing = shell.filter((p) => !all.includes(p));
 if (missing.length) throw new Error(`sw.js precaches missing files: ${missing.join(', ')}`);
-const uncached = all.filter((p) => p.startsWith('src/') && !shell.includes(p));
+const uncached = all.filter((p) => (p.startsWith('src/') || p.startsWith('fonts/')) && !shell.includes(p));
 if (uncached.length) throw new Error(`src files not precached by sw.js (app would break offline): ${uncached.join(', ')}`);
 
 const hash = createHash('sha256');
