@@ -5,7 +5,8 @@ import { readFile, mkdir, writeFile } from 'node:fs/promises';
 import { extname, join, normalize } from 'node:path';
 import { chromium, devices } from 'playwright';
 
-const root = new URL('..', import.meta.url).pathname;
+// Tests the built dist/ when SMOKE_ROOT=dist, otherwise the source tree.
+const root = join(new URL('..', import.meta.url).pathname, process.env.SMOKE_ROOT || '');
 const out = process.argv[2] || join(root, 'test-results');
 await mkdir(out, { recursive: true });
 

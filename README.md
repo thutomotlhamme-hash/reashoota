@@ -52,13 +52,16 @@ PDFs come from a small built-in writer (`src/pdf.js`), so they generate offline 
 ## Develop
 
 ```sh
-npm start          # serve at http://localhost:5173
+npm start          # serve the source at http://localhost:5173
+npm run build      # deployable dist/ (Netlify runs this automatically)
+npm run preview    # build, then serve dist/
 npm test           # unit tests (node --test)
-node scripts/smoke.mjs   # end-to-end on an emulated iPhone (needs Playwright + Chromium)
+node scripts/smoke.mjs                 # end-to-end on an emulated iPhone (needs Playwright + Chromium)
+SMOKE_ROOT=dist node scripts/smoke.mjs # same, against the build
 npm run icons      # re-render PNG icons from icons/icon.svg (needs Playwright)
 ```
 
-After changing app files, bump `VERSION` in `sw.js` so installed copies clean up their old cache.
+The build copies the app as-is (there is nothing to compile). It stamps the service worker cache version with a hash of the app files, so phones pick up each deploy automatically. It also fails if `sw.js` would leave a source file uncached, because the app would then break offline.
 
 | File | Role |
 | --- | --- |
