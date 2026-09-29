@@ -139,3 +139,26 @@ test('USE THIS becomes a full production shot in the right slot, and is undoable
   assert.equal(applyIdea(empty, { ...m, videoT: 0 }, idea, createShot), 0);
   assert.equal(empty.shots[0].echo.ideaId, idea.id);
 });
+
+test('templates get a real idea in every slot, matched to its role, never repeated', async () => {
+  const { applyTemplate } = await import('../src/timeline.js');
+  const { fillSlotIdeas } = await import('../src/echo/engine.js');
+  const p = createProject({ lyrics: ['Everybody watching me', 'My heart went cold', 'They switched sides'] });
+  applyTemplate(p, 'perf-broll');
+  assert.equal(fillSlotIdeas(p), p.shots.length);
+  const ids = p.shots.map((s) => s.echo.ideaId);
+  assert.equal(new Set(ids).size, ids.length, 'no idea used twice');
+  for (const s of p.shots) {
+    assert.ok(!/^B-roll \d+$/.test(s.title), s.title);
+    assert.ok(s.echo.howTo.length && s.echo.why, 'DO THIS + why');
+  }
+  const broll = p.shots.find((s) => s.echo.role === 'B-roll');
+  assert.ok(['object', 'weird', 'metaphor'].includes(broll.echo.dir), broll.echo.dir);
+  assert.ok(p.direction.motifs.length > 0, 'world seeded');
+  // Pasting new lyrics later refreshes only the auto-filled ideas.
+  p.shots[0].echo.auto = false;
+  const keep = p.shots[0].echo.ideaId;
+  p.lyrics = ['I carry the whole team'];
+  fillSlotIdeas(p, { onlyAuto: true });
+  assert.equal(p.shots[0].echo.ideaId, keep);
+});

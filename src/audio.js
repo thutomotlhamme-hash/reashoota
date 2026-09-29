@@ -13,10 +13,48 @@ export function audioContext() {
 }
 
 // Must be called synchronously inside a tap on iOS, before any await.
+// iPhones mute web audio when the ring/silent switch is on. Declaring a "playback" audio
+// session (iOS 16.4+) and keeping a silent media element playing moves the page into the
+// media category, so the song is heard like any music app.
+let silentEl = null;
+function silentWavUrl() {
+  const rate = 8000;
+  const n = rate / 2;
+  const buf = new ArrayBuffer(44 + n);
+  const v = new DataView(buf);
+  const w = (o, str) => { for (let i = 0; i < str.length; i += 1) v.setUint8(o + i, str.charCodeAt(i)); };
+  w(0, 'RIFF'); v.setUint32(4, 36 + n, true); w(8, 'WAVEfmt '); v.setUint32(16, 16, true);
+  v.setUint16(20, 1, true); v.setUint16(22, 1, true); v.setUint32(24, rate, true); v.setUint32(28, rate, true);
+  v.setUint16(32, 1, true); v.setUint16(34, 8, true); w(36, 'data'); v.setUint32(40, n, true);
+  for (let i = 0; i < n; i += 1) v.setUint8(44 + i, 128);
+  return URL.createObjectURL(new Blob([buf], { type: 'audio/wav' }));
+}
+
 export function unlockAudio() {
+  try { if (navigator.audioSession) navigator.audioSession.type = 'playback'; } catch { /* older iOS */ }
   const c = audioContext();
-  if (c.state === 'suspended') c.resume();
+  if (c.state === 'suspended' || c.state === 'interrupted') c.resume();
+  // A one-sample buffer played inside the tap fully unlocks the context on iOS.
+  try {
+    const b = c.createBuffer(1, 1, 22050);
+    const src = c.createBufferSource();
+    src.buffer = b;
+    src.connect(c.destination);
+    src.start(0);
+  } catch { /* ignore */ }
+  try {
+    if (!silentEl) {
+      silentEl = new Audio(silentWavUrl());
+      silentEl.loop = true;
+      silentEl.setAttribute('playsinline', '');
+    }
+    silentEl.play().catch(() => {});
+  } catch { /* ignore */ }
   return c;
+}
+
+export function releaseAudio() {
+  silentEl?.pause();
 }
 
 const buffers = new Map();

@@ -21,13 +21,13 @@ import {
   TEMPLATES, FX_LABELS, PX_PER_SEC, applyTemplate, autoFillTargets, buildBeatSlots, filledCount, formatTime,
   loudestWindow, slotTimes, songOffset, totalDuration, captionAt,
 } from './timeline.js';
-import { analyse, decodeSong, playSong, unlockAudio, audioContext } from './audio.js';
+import { analyse, decodeSong, playSong, unlockAudio, releaseAudio, audioContext } from './audio.js';
 import { TimelinePlayer, loadMedia } from './render.js';
 import { cameraSupported, closeCamera, openCamera, recordTake, videoThumb } from './camera.js';
 import { CAPTION_FONTS, CAPTION_STYLES, loadCaptionFont } from './captions.js';
 import { currentTake } from './project.js';
 import {
-  MODIFIERS, MOTIFS, WEIRDNESS, applyIdea, buildMoments, getIdea, markerFor, moreLike, strongest, suggest,
+  MODIFIERS, MOTIFS, WEIRDNESS, applyIdea, fillSlotIdeas, buildMoments, getIdea, markerFor, moreLike, strongest, suggest,
 } from './echo/engine.js';
 
 const $ = (sel, root = document) => root.querySelector(sel);
@@ -176,6 +176,7 @@ function render() {
   renderStatus();
   hydrateMedia(app);
   if (state.project && (state.view === 'timeline' || state.view === 'captions')) refreshMonitor();
+  if (state.project?.track && (state.view === 'song' || state.view === 'timeline')) prepareSongEl();
   if (state.view === 'timeline') scrollSlotIntoView();
 }
 
@@ -229,7 +230,7 @@ function homeView() {
     ${cards || `<div class="empty-card"><p>No videos yet. Start one, or open the demo to see how the timeline, captions and exports work.</p><button class="btn" data-action="demo">Open the demo</button></div>`}
     <div class="home-foot">
       <button class="btn ghost" data-action="import">Import backup</button>
-      ${state.cloud ? '<button class="btn ghost" data-action="sync-now">Back up now</button>' : '<button class="btn ghost" data-action="sign-in">Sign in to back up</button>'}
+      <button class="btn ghost" data-action="backup-info">Back up</button>
     </div>
     ${state.cloud ? accountCard() : ''}
   </div>`;
@@ -1039,8 +1040,9 @@ async function ensureMedia() {
 
 function stopPlayback() {
   if (player?.playing) player.stop();
-  songPreview?.stop();
+  songPreview?.pause();
   songPreview = null;
+  releaseAudio();
 }
 
 async function refreshMonitor() {
@@ -1077,7 +1079,8 @@ function updatePlayhead(t) {
 }
 function setPlayIcon(on) {
   const b = $('#play-btn');
-  if (b) { b.innerHTML = icon(on ? 'pause' : 'play', 16); b.setAttribute('aria-label', on ? 'Pause' : 'Play timeline'); }
+  if (b) { b.innerHTML = `<span>${icon(on ? 'pause' : 'play', 22)}</span>${on ? 'Pause' : 'Play'}`; b.setAttribute('aria-label', on ? 'Pause' : 'Play timeline'); }
+  if (!on) releaseAudio();
 }
 // Scroll only the timeline strip (never the page) so the selected slot is centred.
 function scrollSlotIntoView() {
@@ -1183,7 +1186,6 @@ function timelineView() {
       <div class="transport">
         <span class="mono"><span id="tc">${formatTime(cur?.start || 0)}</span> <span class="muted">/ ${formatTime(total)}</span></span>
         ${moments.length ? `<button class="idea-toggle" data-action="toggle-ideas" aria-pressed="${state.allIdeas}">✦ ${state.allIdeas ? `All ${moments.length} ideas` : `${shownMoments.length} key ideas`}</button>` : ''}
-        <button class="round" id="play-btn" data-action="play" aria-label="Play timeline" ${noShots ? 'disabled' : ''}>${icon('play', 16)}</button>
       </div>
       ${noShots ? '<button class="cta small" data-action="go" data-view="templates">PICK A TEMPLATE</button>' : `
       <div class="strip-wrap" id="strip">
@@ -1196,7 +1198,7 @@ function timelineView() {
         </div>
       </div>`}
       <div class="shoot-row">
-        <button class="side" data-action="go" data-view="templates"><span>${icon('grid', 22)}</span>Auto-fill</button>
+        <button class="side" id="play-btn" data-action="play" aria-label="Play timeline" ${noShots ? 'disabled' : ''}><span>${icon('play', 22)}</span>Play</button>
         <button class="shoot" data-action="open-camera" ${noShots ? 'disabled' : ''} aria-label="Shoot ${cur ? label(cur.index) : ''}"><span>SHOOT</span></button>
         <button class="side" data-action="slot-from-photos" ${noShots ? 'disabled' : ''}><span>${icon('photos', 22)}</span>From Photos</button>
       </div>
@@ -1269,8 +1271,12 @@ function lyricsBlock(p) {
   const timed = p.lyrics.filter((_, i) => Number.isFinite(times[i])).length;
   return `<div class="row between"><p class="eyebrow">LYRICS${p.lyrics.length ? ` · ${timed} OF ${p.lyrics.length} TIMED` : ''}</p>
       <button class="link-btn" data-action="edit-lyrics">${p.lyrics.length ? 'Edit' : 'Paste lyrics'}</button></div>
-    <div class="card lyric-list">${p.lyrics.map((l, i) => `<div class="lyric"><span class="mono">${Number.isFinite(times[i]) ? formatTime(times[i], { tenths: false }) : '--:--'}</span><span>${esc(l)}</span></div>`).join('')
-      || '<p class="muted">Paste your lyrics — they become captions and tell each shot what line it covers.</p>'}</div>`;
+    ${p.lyrics.length ? `<div class="card lyric-list">${p.lyrics.map((l, i) => `<div class="lyric"><span class="mono">${Number.isFinite(times[i]) ? formatTime(times[i], { tenths: false }) : '--:--'}</span><span>${esc(l)}</span></div>`).join('')}</div>`
+    : `<form class="card lyric-paste" data-form="lyrics">
+        <label class="sr" for="lyrics-inline">Lyrics</label>
+        <textarea id="lyrics-inline" name="lyrics" rows="6" placeholder="Tap here and paste your lyrics — one line per line. They become captions and give every shot its idea."></textarea>
+        <button class="btn primary">Save lyrics</button>
+      </form>`}`;
 }
 
 function captionsView() {
@@ -1585,6 +1591,13 @@ Object.assign(handlers, {
     toast(`${label(idx)} planned ✦ — undo from Plan › Shots`, 'ok');
   },
   'toggle-ideas'() { state.allIdeas = !state.allIdeas; render(); },
+  'backup-info'() {
+    const list = state.projects;
+    openSheet(`<h2>Back up your videos</h2>
+      <p class="small muted">Everything is saved on this phone automatically. To keep a copy somewhere else, save a backup file to Files or iCloud Drive — open it on any phone with <b>Import backup</b>. Account sign-in is coming later.</p>
+      <div class="stack">${list.map((pr) => `<button class="btn" data-action="home-export" data-id="${pr.id}" data-export="backup" data-format="json">Save “${esc(pr.name)}” backup</button>`).join('') || '<p class="muted">No projects yet.</p>'}</div>
+      <button class="btn ghost" data-action="close-sheet">Close</button>`);
+  },
 });
 
 // ---- camera overlay ----
@@ -1600,7 +1613,7 @@ function camOverlayHtml() {
   return `<video class="cam-feed" id="cam-feed" playsinline muted autoplay></video>
     <div class="cam-grid"><i></i><i></i><i></i><i></i></div>
     <div class="cam-top">
-      <button class="icon-btn glass" data-action="cam-close" aria-label="Close camera">${icon('close')}</button>
+      <button class="cam-done glass" data-action="cam-close">${icon('back', 18)} Editor</button>
       <div class="glass cam-info"><span class="mono-tag">${label(s.index)} · SLOT ${(s.end - s.start).toFixed(1)}s · TAKE ${shot.takes.length + 1}</span><b>${esc(shot.title)}</b></div>
     </div>
     <div class="cam-count" id="cam-count" aria-live="assertive"></div>
@@ -1664,10 +1677,17 @@ async function camRecord() {
   btn.classList.add('armed');
   const countEl = $('#cam-count');
   const n = Number(p.shootSettings.countdownSec) || 0;
-  const m = await ensureMedia();
-  // Song plays through the countdown so the artist can come in on time.
+  // Song plays through the countdown so the artist can come in on time (started in the tap).
+  const songEl = p.track && songEls.get(p.track.assetId);
   let song = null;
-  if (m.song) song = playSong(m.song, Math.max(0, songOffset(p) + slot.start - n), songOffset(p) + slot.end);
+  if (songEl) {
+    songEl.currentTime = Math.max(0, songOffset(p) + slot.start - n);
+    songEl.play().catch(() => {});
+    song = { stop: () => songEl.pause() };
+  } else if (p.track) {
+    const m = await ensureMedia();
+    if (m.song) song = playSong(m.song, Math.max(0, songOffset(p) + slot.start - n), songOffset(p) + slot.end);
+  }
   try {
     for (let i = n; i > 0; i -= 1) {
       if (cam.abort.signal.aborted) throw new DOMException('Cancelled', 'AbortError');
@@ -1689,9 +1709,7 @@ async function camRecord() {
     await storeTake(shot, res.blob, { mime: res.type, dur: res.dur });
     commit({ render: false });
     toast(`Take saved to ${label(state.sel)}`, 'ok');
-    state.sel = nextEmptySlot(state.sel);
-    persistSession();
-    openCameraView();
+    afterTake();
   } catch (err) {
     if (err.name !== 'AbortError') toast(err.message, 'error');
     else if (countEl) countEl.textContent = '';
@@ -1702,8 +1720,47 @@ async function camRecord() {
   }
 }
 
+// Next empty slot, or the wrap screen once every slot has a take.
+function afterTake() {
+  const p = state.project;
+  if (p.shots.every((s) => s.takes.length)) { showWrap(); return; }
+  state.sel = nextEmptySlot(state.sel);
+  persistSession();
+  openCameraView();
+}
+
+function showWrap() {
+  const p = state.project;
+  const el = $('.cam');
+  if (!el) return;
+  closeCamera(cam.stream);
+  cam.stream = null;
+  el.innerHTML = `<div class="wrap-screen">
+    <span class="wrap-badge" aria-hidden="true">✓</span>
+    <p class="eyebrow">ALL ${p.shots.length} SLOTS FILMED</p>
+    <h2 class="display">THAT’S A WRAP</h2>
+    <p class="wrap-sub">Every slot has a take. Watch the edit, swap any take, or make the final video.</p>
+    <button class="btn primary big" data-action="wrap-editor">BACK TO EDITOR</button>
+    <button class="btn big" data-action="wrap-make">MAKE VIDEO</button>
+  </div>`;
+  navigator.vibrate?.([60, 60, 120]);
+}
+
 let songPreview = null;
 let syncState = null;
+
+// A ready-to-play <audio> for the song, created before the tap (iOS needs play() in the tap).
+const songEls = new Map();
+async function prepareSongEl() {
+  const id = state.project?.track?.assetId;
+  if (!id || songEls.has(id)) return;
+  const a = await store.getAsset(id);
+  if (!a) return;
+  const el = new Audio(URL.createObjectURL(a.blob));
+  el.preload = 'auto';
+  el.setAttribute('playsinline', '');
+  songEls.set(id, el);
+}
 
 // ---- handlers ----
 
@@ -1723,6 +1780,12 @@ Object.assign(handlers, {
     if (player?.playing) { player.stop(); setPlayIcon(false); return; }
     unlockAudio();
     setPlayIcon(true);
+    // iPhones only allow sound that starts inside the tap, so start now if media is ready.
+    if (media && player && keyOf(state.project) === mediaKey) {
+      player.media = media;
+      player.play(selStart());
+      return;
+    }
     ensureMedia().then(() => {
       if (!player) return;
       player.media = media;
@@ -1740,6 +1803,8 @@ Object.assign(handlers, {
     openCameraView();
   },
   'cam-close': closeCameraView,
+  'wrap-editor'() { state.sel = 0; closeCameraView(); window.scrollTo(0, 0); },
+  'wrap-make'() { unlockAudio(); closeCameraView(); openSaveSheet(); },
   'cam-record': camRecord,
   async 'cam-flip'() {
     if (cam.busy) return;
@@ -1756,8 +1821,7 @@ Object.assign(handlers, {
     await storeTake(shot, file, { name: file.name });
     commit({ render: false });
     toast(`Take saved to ${label(state.sel)}`, 'ok');
-    state.sel = nextEmptySlot(state.sel);
-    openCameraView();
+    afterTake();
   },
   async 'slot-from-photos'() {
     const [file] = await pickFile('video/*');
@@ -1781,10 +1845,11 @@ Object.assign(handlers, {
     const filled = filledCount(p);
     if (filled && !window.confirm(`Replace your ${p.shots.length} slots? The ${filled} filmed take${filled === 1 ? '' : 's'} will be removed from the timeline.`)) return;
     applyTemplate(p, state.tpl);
+    fillSlotIdeas(p, { weirdness: p.echoSettings.weirdness });
     state.sel = 0;
     state.view = 'timeline';
     commit();
-    toast(p.track?.bpm ? `Slots snapped to ${p.track.bpm} BPM` : 'Template ready — add your song to cut on the beat', 'ok');
+    toast(`${p.shots.length} slots, each with a shot idea${p.track?.bpm ? ` · snapped to ${p.track.bpm} BPM` : ''}`, 'ok');
   },
   async 'auto-fill'() {
     const files = await pickFile('video/*', { multiple: true });
@@ -1842,18 +1907,24 @@ Object.assign(handlers, {
     }
     commit();
   },
-  async 'song-preview'() {
-    if (songPreview) { songPreview.stop(); songPreview = null; $('#song-play').innerHTML = icon('play', 18); return; }
+  'song-preview'() {
+    const btn = $('#song-play');
+    if (songPreview) { songPreview.pause(); songPreview = null; releaseAudio(); btn.innerHTML = icon('play', 18); return; }
     unlockAudio();
-    const p = state.project;
-    const a = await store.getAsset(p.track.assetId);
-    const buf = await decodeSong(a.blob, a.id);
-    songPreview = playSong(buf, p.track.range.start, p.track.range.end);
-    songPreview.onended = () => { songPreview = null; const b = $('#song-play'); if (b) b.innerHTML = icon('play', 18); };
-    $('#song-play').innerHTML = icon('pause', 18);
+    const el = songEls.get(state.project.track.assetId);
+    if (!el) { toast('Song is still loading — tap again in a second', 'error'); prepareSongEl(); return; }
+    const { start: from, end: to } = state.project.track.range;
+    el.currentTime = from;
+    el.play().then(() => { btn.innerHTML = icon('pause', 18); }).catch((err) => toast(`Can’t play the song: ${err.message}`, 'error'));
+    songPreview = el;
+    el.ontimeupdate = () => {
+      if (el.currentTime >= to) { el.pause(); songPreview = null; releaseAudio(); const b = $('#song-play'); if (b) b.innerHTML = icon('play', 18); }
+    };
   },
   'beat-slots'() {
+    const hadShots = state.project.shots.length;
     buildBeatSlots(state.project);
+    if (!hadShots) fillSlotIdeas(state.project, { weirdness: state.project.echoSettings.weirdness });
     state.view = 'timeline';
     commit();
     toast(`${state.project.shots.length} slots cut on the beat`, 'ok');
@@ -1930,8 +2001,16 @@ Object.assign(forms, {
       return i >= 0 ? p.lyricTimes[i] ?? null : null;
     });
     p.lyrics = next;
+    // Slots without a line get the next lyric; auto-generated ideas follow the new words.
+    let k = 0;
+    for (const s of p.shots) {
+      if (!s.lyric && next[k]) s.lyric = next[k];
+      if (next[k]) k += 1;
+    }
+    fillSlotIdeas(p, { weirdness: p.echoSettings.weirdness, onlyAuto: true });
     closeSheet();
     commit();
+    toast(`${next.length} lyric line${next.length === 1 ? '' : 's'} saved — captions and ideas updated`, 'ok');
   },
 });
 

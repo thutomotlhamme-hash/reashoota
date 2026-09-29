@@ -68,12 +68,19 @@ export async function loadMedia(project) {
     }
   }
   let song = null;
+  let songEl = null;
   if (project.track?.assetId) {
     const a = await getAsset(project.track.assetId);
-    if (a) { try { song = await decodeSong(a.blob, a.id); } catch { song = null; } }
+    if (a) {
+      try { song = await decodeSong(a.blob, a.id); } catch { song = null; }
+      // Live playback uses a media element: iPhones play it even with the silent switch on.
+      songEl = new Audio(await blobUrl(a.id));
+      songEl.preload = 'auto';
+      songEl.setAttribute('playsinline', '');
+    }
   }
   await loadCaptionFont(project.captions.font);
-  return { clips, frames, song };
+  return { clips, frames, song, songEl };
 }
 
 function drawEmpty(ctx, slot, W, H) {
@@ -107,6 +114,17 @@ export class TimelinePlayer {
 
   get duration() { return totalDuration(this.project); }
 
+  // Clip sound for song-less edits: to the speakers in preview, into the recording on export.
+  routeClipAudio(v) {
+    if (this.destination) {
+      const ac = audioContext();
+      if (!v.audioNode) { try { v.audioNode = ac.createMediaElementSource(v); } catch { return; } }
+      try { v.audioNode.disconnect(); } catch { /* not connected */ }
+      v.audioNode.connect(this.destination);
+    }
+    v.muted = false;
+  }
+
   sourceSlot(slots, i) {
     if (this.media.clips.has(slots[i].shot.id)) return slots[i];
     for (let k = i - 1; k >= 0; k -= 1) if (this.media.clips.has(slots[k].shot.id)) return slots[k];
@@ -128,9 +146,11 @@ export class TimelinePlayer {
     if (live && slot.index !== this.activeSlot) {
       this.activeSlot = slot.index;
       if (v !== this.activeVideo) {
-        this.activeVideo?.pause();
+        if (this.activeVideo) { this.activeVideo.pause(); this.activeVideo.muted = true; }
         this.activeVideo = v || null;
         if (v) {
+          // No song: the clip's own sound is the soundtrack.
+          if (this.clipAudio) this.routeClipAudio(v);
           const want = src === slot ? Math.max(0, t - slot.start) : 0;
           // Only seek when needed: slots normally start their clip from the top.
           if (Math.abs(v.currentTime - want) > 0.25) { try { v.currentTime = want; } catch { /* not seekable */ } }
@@ -180,9 +200,20 @@ export class TimelinePlayer {
     this.playing = true;
     this.activeSlot = -1;
     const song = this.media.song;
+    const el = this.media.songEl;
+    const off = songOffset(this.project);
+    this.clipAudio = !song && !el;
     let clock;
-    if (song) {
-      const off = songOffset(this.project);
+    if (el && !this.destination) {
+      // Preview: the song plays through a media element and drives the clock.
+      el.currentTime = off + from;
+      el.play().catch(() => {});
+      this.el = el;
+      const t0 = performance.now();
+      clock = () => (el.paused || el.currentTime < off + from - 0.05
+        ? from + (performance.now() - t0) / 1000
+        : el.currentTime - off);
+    } else if (song) {
       this.audio = playSong(song, off + from, off + total, { destination: this.destination });
       const ac = audioContext();
       const startAt = this.audio.startAt;
@@ -216,6 +247,8 @@ export class TimelinePlayer {
     cancelAnimationFrame(this.raf);
     this.audio?.stop();
     this.audio = null;
+    this.el?.pause();
+    this.el = null;
     for (const v of this.media.clips.values()) v.pause();
     this.activeVideo = null;
     this.activeSlot = -1;
@@ -234,19 +267,17 @@ function pickMime(withAudio) {
 // Records the whole timeline to a vertical video with the song. Takes real time.
 export async function renderFinal(project, { onProgress, onCanvas, signal, width = 1080, height = 1920 } = {}) {
   const media = await loadMedia(project);
-  const mime = pickMime(!!media.song);
+  const mime = pickMime(true);
   if (!mime) throw new Error('This browser can’t record video. Use Safari on iPhone.');
   const canvas = document.createElement('canvas');
   canvas.width = width;
   canvas.height = height;
   const ac = audioContext();
-  const dest = media.song ? ac.createMediaStreamDestination() : null;
+  const dest = ac.createMediaStreamDestination();
   // Song goes through a gain node so it can fade out with the picture.
   let gain = null;
-  if (dest) {
-    gain = ac.createGain();
-    gain.connect(dest);
-  }
+  gain = ac.createGain();
+  gain.connect(dest);
   const total = totalDuration(project);
   const player = new TimelinePlayer(project, media, {
     canvas, destination: gain, fades: true, fillGaps: true, onTime: (t) => onProgress?.(t / total),
@@ -256,7 +287,7 @@ export async function renderFinal(project, { onProgress, onCanvas, signal, width
   onCanvas?.(canvas);
   const stream = new MediaStream([
     ...canvas.captureStream(30).getVideoTracks(),
-    ...(dest ? dest.stream.getAudioTracks() : []),
+    ...dest.stream.getAudioTracks(),
   ]);
   const rec = new MediaRecorder(stream, { mimeType: mime, videoBitsPerSecond: 12_000_000, audioBitsPerSecond: 256_000 });
   const chunks = [];
@@ -265,7 +296,7 @@ export async function renderFinal(project, { onProgress, onCanvas, signal, width
   const abort = () => player.stop();
   signal?.addEventListener('abort', abort);
   rec.start(500);
-  if (gain) {
+  {
     const t0 = ac.currentTime + 0.05;
     gain.gain.setValueAtTime(1, t0 + Math.max(0, total - 0.6));
     gain.gain.linearRampToValueAtTime(0.0001, t0 + total);

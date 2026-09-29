@@ -119,6 +119,10 @@ try {
   await page.waitForSelector('.song-wave');
   const meta = await page.textContent('.song-card');
   check(/1[12]\d BPM|120 BPM/.test(meta), `BPM found: ${meta}`);
+  await page.waitForTimeout(400);
+  await page.click('#song-play');
+  await page.waitForFunction(() => document.querySelector('#song-play rect'), null, { timeout: 5000 });
+  await page.click('#song-play');
   await shot('03-song');
   await page.click('[data-action="beat-slots"]');
   await page.waitForSelector('.slot');
@@ -131,6 +135,9 @@ try {
   await page.click('[data-action="use-tpl"]');
   await page.waitForSelector('.slot');
   check((await page.$$('.slot')).length === 9, 'hook template has 9 slots');
+  const slotTitle = await page.textContent('.shot-info h2');
+  check(/·/.test(slotTitle) && !/^\w+ \d+$/.test(slotTitle.trim()), `template slot has a real idea: ${slotTitle}`);
+  check(/DO THIS|WHY IT CONNECTS/i.test(await page.textContent('.shot-info')), 'slot shows why it connects');
   await page.click('.tool >> text=Templates');
   await choose(() => page.click('[data-action="auto-fill"]'), clipPaths);
   await page.waitForSelector('.slot.filled >> nth=2', { timeout: 30000 });
@@ -186,6 +193,32 @@ try {
   await page.click('[data-action="cam-close"]');
   await page.waitForSelector('.slot');
 
+  step('fill every slot → camera shows the wrap screen');
+  const empties = await page.$$eval('.slot.empty', (els) => els.length);
+  if (empties) {
+    await page.click('.tool >> text=Templates');
+    await choose(() => page.click('[data-action="auto-fill"]'), Array.from({ length: empties }, (_, i) => clipPaths[i % clipPaths.length]));
+    await page.waitForFunction(() => !document.querySelector('.slot.empty'), null, { timeout: 60000 });
+  }
+  await page.click('.slot >> nth=0');
+  await page.click('[data-action="open-camera"]');
+  await page.waitForSelector('.cam-feed');
+  await page.waitForTimeout(500);
+  await page.click('#rec-btn');
+  await page.waitForSelector('.wrap-screen', { timeout: 30000 });
+  await shot('07d-wrap');
+  await page.click('[data-action="wrap-editor"]');
+  await page.waitForSelector('.slot');
+  check(!(await page.$('.cam')), 'back in the editor');
+
+  step('play sits next to SHOOT');
+  const pb = await page.locator('#play-btn').boundingBox();
+  const sb = await page.locator('.shoot').boundingBox();
+  check(Math.abs((pb.y + pb.height / 2) - (sb.y + sb.height / 2)) < 30, 'play and shoot on one row');
+  await page.click('#play-btn');
+  await page.waitForTimeout(800);
+  await page.click('#play-btn');
+
   step('make the final video');
   await page.click('[data-action="open-save"]');
   await page.waitForSelector('[data-action="make-video"]');
@@ -208,12 +241,28 @@ try {
   await page.reload();
   await page.waitForSelector('.slot.on');
   check((await page.getAttribute('.slot.on', 'data-i')) === '1', 'selected slot restored');
-  check((await page.$$('.slot.filled')).length === 4, 'takes restored');
+  check((await page.$$('.slot.filled')).length >= 4, 'takes restored');
   await page.evaluate(() => navigator.serviceWorker.ready);
   await context.setOffline(true);
   await page.reload();
   await page.waitForSelector('.slot.filled');
   await context.setOffline(false);
+
+  step('new video: paste lyrics inline');
+  await page.click('[data-action="home"]');
+  await page.click('[data-action="new-project"]');
+  await page.fill('input[name="song"]', 'Test Song');
+  await page.click('form[data-form="quick-new"] button');
+  await page.waitForSelector('[data-action="use-tpl"]');
+  await page.click('[data-action="use-tpl"]');
+  await page.waitForSelector('.slot');
+  await page.click('.tool >> text=Add song');
+  await page.fill('#lyrics-inline', 'Everybody watching me\nMy heart went cold\nThey switched sides');
+  await page.click('.lyric-paste button');
+  await page.waitForSelector('.lyric-list .lyric >> nth=2');
+  await shot('08b-lyrics');
+  await page.click('[data-action="go"][data-view="timeline"]');
+  await page.waitForSelector('.echo-mark');
 
   step('home');
   await page.click('[data-action="home"]');

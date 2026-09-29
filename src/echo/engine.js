@@ -7,7 +7,7 @@
 // six directions, steered by the weirdness slider, SPIN modifiers and the video's motif world.
 
 import { CONCEPTS, GENERIC, SONIC, MOTIFS } from './lexicon.js';
-import { loudestWindow, slotTimes, songOffset, totalDuration, snapToBeat, formatTime } from '../timeline.js';
+import { loudestWindow, slotTimes, songOffset, snapToBeat, formatTime } from '../timeline.js';
 
 export { MOTIFS };
 
@@ -408,4 +408,52 @@ function growWorld(project, idea) {
     if (world.length >= 4) break;
     if (!world.includes(m)) world.push(m);
   }
+}
+
+// Give every slot of a fresh layout (template / beat slots) a real idea instead of
+// "B-roll 3": the slot's role picks the direction, its lyric (or the song's lyrics in
+// order) picks the concept, and ideas never repeat within the video.
+const ROLE_DIRS = [
+  [/b-roll|detail|build|tension|insert/i, ['object', 'weird', 'metaphor']],
+  [/performance|face|one take|verse/i, ['literal', 'practical', 'metaphor']],
+  [/hook|drop|chorus|close-up|move/i, ['weird', 'metaphor', 'object']],
+  [/wide|outro|pre/i, ['metaphor', 'literal', 'weird']],
+];
+
+export function fillSlotIdeas(project, { weirdness = 1, onlyAuto = false } = {}) {
+  const slots = slotTimes(project);
+  const off = songOffset(project);
+  const used = [];
+  const world = [...(project.direction.motifs || [])];
+  const lyrics = project.lyrics.filter((l) => l.trim());
+  let filled = 0;
+  for (const s of slots) {
+    const shot = s.shot;
+    if (shot.echo && !(onlyAuto && shot.echo.auto)) { if (shot.echo.ideaId) used.push(shot.echo.ideaId); continue; }
+    const role = shot.echo?.role || shot.title.replace(/\s*\d+$/, '').trim() || 'Shot';
+    const lyric = shot.lyric || (lyrics.length ? lyrics[s.index % lyrics.length] : '');
+    const m = { id: `slot-${s.index}`, kind: 'lyric', t: off + s.start, end: off + s.end, videoT: s.start, lyric };
+    const r = suggest(m, { weirdness, world, seed: s.index, exclude: used });
+    const prefs = ROLE_DIRS.find(([re]) => re.test(role))?.[1] || [];
+    let idea = r.headline;
+    for (const d of prefs) {
+      const hit = r.directions.find((x) => x.id === d && !used.includes(x.idea.id));
+      if (hit) { idea = hit.idea; break; }
+    }
+    if (!idea) continue;
+    const f = ideaToShot(idea, m, project);
+    Object.assign(shot, {
+      title: `${role} · ${f.title}`,
+      description: f.description,
+      camera: f.camera,
+      location: f.location,
+      props: f.props,
+      echo: { ...f.echo, auto: true, role },
+    });
+    used.push(idea.id);
+    for (const mo of idea.motifs) if (world.length < 4 && !world.includes(mo)) world.push(mo);
+    filled += 1;
+  }
+  if (!(project.direction.motifs || []).length) project.direction.motifs = world;
+  return filled;
 }
