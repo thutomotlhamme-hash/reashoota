@@ -158,6 +158,11 @@ function shotTextLines(b) {
   add('Location', s.location);
   add('Props', s.props.join(', '));
   add('Duration', s.durationSec ? `${s.durationSec}s` : '');
+  add('Why', s.echo?.why);
+  add('Light', s.echo?.light);
+  add('Do this', s.echo?.howTo?.join(' → '));
+  add('AI', s.echo?.ai);
+  add('Cut', s.echo?.cut);
   add('Notes', s.notes);
   return lines;
 }

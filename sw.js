@@ -29,6 +29,8 @@ const SHELL = [
   './src/render.js',
   './src/camera.js',
   './src/captions.js',
+  './src/echo/engine.js',
+  './src/echo/lexicon.js',
   './fonts/fonts.css',
   './fonts/Anton-400.woff2',
   './fonts/ArchivoBlack-400.woff2',

@@ -12,6 +12,16 @@ It is a static PWA. There is no build step and nothing to install at runtime, so
 - **Song:** add an MP3/M4A/WAV. ReaShoota finds the BPM and draws the waveform. Pick Full, Best 30s (the loudest stretch), a 15s hook, or a custom range. **Build slots on the beat** snaps every cut to half-bars.
 - **Lyrics & captions:** paste the lyrics, then **Tap to sync** once while the song plays. Captions appear word by word in one of four styles (Pop, Karaoke, Clean, Boxed) and six bundled fonts. They sit in the TikTok/Reels/Shorts safe zone, clear of the platform's buttons. Without syncing, each shot's lyric is spread across its slot.
 - **Final video:** **Save → Make video** renders a 1080×1920 video at 12 Mbps. It includes the song, burned-in captions, the edit effects, and a fade in and out. Unfilmed slots reuse the nearest clip. You watch it live while it renders, then save it to Photos from the share sheet. Safari on iPhone produces H.264/AAC MP4.
+- **Young-D-Guide (the timeline as creative director):** ReaShoota treats every lyric line, repeated hook, bass hit, drop-out, beat switch and ad-lib as a creative opportunity, and marks each one on the timeline (◆ lyric visual · ✦ weird · ○ easy practical · ⬡ AI/hybrid · ↗ transition · ⚡ hero moment). An echo card under the shot follows the playhead. Tap a marker to get:
+  - the **association chain**: what the line means, how it feels, and the visual world it lives in;
+  - a headline **visual echo** plus the other directions (Literal, Object rhyme, Metaphor, Weird/surreal, Practical, Premium/AI hybrid). Each comes with *why it connects*;
+  - a **SAFE → STRANGE → UNHINGED** slider. Unhinged stays tied to the line, never random;
+  - **SPIN THIS MOMENT** with modifiers (weirder, cheaper, more cinematic, street, luxury, emotional, minimal, surreal, solo shoot, AI version). Spin never repeats an idea you've already seen for that moment. There's also **More like this** and a per-idea ↻;
+  - a **visual world** (water, glass, mirrors, ice, chrome, CCTV…). It grows from the ideas you pick, and later suggestions stay inside it.
+
+  **USE THIS** turns an idea into a production shot in the slot at that moment: visual, why it connects, shot size, camera position, movement, lens, fps, lighting, location, props, how to shoot it, AI needs and cut points. The previous plan is kept for undo. In the camera it becomes a short **DO THIS** card: shot and timecode, lyric, three steps, camera, duration, START COUNTDOWN.
+
+  The engine (`src/echo/`) runs entirely on the phone. It uses a hand-written library of about 220 original ideas across 32 lyric concepts plus sound-driven moments. Lines that match no concept get delivery-based ideas. A server-side AI generator could later add to this library through the same `suggest()` interface.
 - **Plan** (list icon): the original shot list, storyboard, creative direction, image rhymes, lyric map, checklist, media and every document export.
 
 Speech-to-text captions and AI clip generation need a server, and none ships with this repo yet.
@@ -87,6 +97,7 @@ The build copies the app as-is (there is nothing to compile). It stamps the serv
 | `src/share.js` | save to phone / share / download / copy |
 | `src/store.js`, `src/offline.js`, `sw.js` | IndexedDB, offline mode, session restore, app-shell cache |
 | `src/backup.js`, `src/cloud.js` | portable bundle and account sync queue |
+| `src/echo/lexicon.js`, `src/echo/engine.js` | Young-D-Guide association library and engine: moments, six directions, weirdness, spin, motif world, idea → shot |
 | `src/timeline.js` | slot timing, templates, beat snapping, BPM detection, caption timing, auto-fill (pure, unit-tested) |
 | `src/render.js` | timeline player and final video render |
 | `src/audio.js`, `src/camera.js`, `src/captions.js` | song decode/analysis, in-app camera, caption styles |

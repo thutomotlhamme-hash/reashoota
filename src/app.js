@@ -26,6 +26,9 @@ import { TimelinePlayer, loadMedia } from './render.js';
 import { cameraSupported, closeCamera, openCamera, recordTake, videoThumb } from './camera.js';
 import { CAPTION_FONTS, CAPTION_STYLES, loadCaptionFont } from './captions.js';
 import { currentTake } from './project.js';
+import {
+  MODIFIERS, MOTIFS, WEIRDNESS, applyIdea, buildMoments, getIdea, markerFor, moreLike, strongest, suggest,
+} from './echo/engine.js';
 
 const $ = (sel, root = document) => root.querySelector(sel);
 const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
@@ -43,6 +46,8 @@ const state = {
   view: 'timeline', // timeline | plan | song | captions | templates (home when no project)
   sel: 0, // selected slot
   tpl: 'hook15',
+  echo: null, // open Young-D-Guide moment: { mid, seed, mods, exclude, more }
+  allIdeas: false, // show every idea marker, not just the strongest
 };
 
 const TABS = [
@@ -1065,6 +1070,10 @@ function updatePlayhead(t) {
   if (ph) ph.style.transform = `translateX(${t * PX_PER_SEC}px)`;
   const tc = $('#tc');
   if (tc) tc.textContent = formatTime(t);
+  // While scrubbing/playing, the echo card follows the song moment under the playhead.
+  const m = momentAt(t);
+  const card = $('#echo-now');
+  if (card && m && card.dataset.m !== m.id) card.outerHTML = echoNowHtml(m);
 }
 function setPlayIcon(on) {
   const b = $('#play-btn');
@@ -1113,6 +1122,16 @@ function timelineView() {
   }
   const hasSections = groups.some((g) => g.name);
 
+  // Young-D-Guide: creative markers riding above the slots.
+  const moments = momentsFor(p);
+  // Short-form edits get denser markers: roughly eight key ideas per video by default.
+  const shownMoments = state.allIdeas ? moments : strongest(moments, Math.max(1.5, Math.min(4, total / 8)));
+  const markers = shownMoments.filter((m) => m.videoT >= -0.01 && m.videoT < total).map((m) => {
+    const mk = markerFor(m, headlineFor(m));
+    return `<button class="echo-mark ${m.hero ? 'hero' : ''} ${state.echo?.mid === m.id ? 'on' : ''}" style="left:${m.videoT * PX_PER_SEC}px" data-action="echo-open" data-m="${m.id}" aria-label="${mk.label}${m.lyric ? `: ${esc(m.lyric)}` : ''}">${mk.icon}</button>`;
+  }).join('');
+  const nowMoment = cur ? (moments.find((m) => m.videoT >= cur.start - 0.01 && m.videoT < cur.end) || null) : null;
+
   const slotHtml = slots.map((s) => {
     const t = currentTake(s.shot);
     const on = s.index === state.sel;
@@ -1145,6 +1164,8 @@ function timelineView() {
     ${shot ? `<section class="shot-info">
       <div class="shot-title-row"><h2>${esc(shot.title)}</h2><span class="mono-sub">${shot.durationSec}s</span></div>
       ${shot.description ? `<p class="shot-desc">${esc(shot.description)}</p>` : ''}
+      ${shot.echo?.why ? `<p class="shot-why"><b>WHY IT CONNECTS</b> ${esc(shot.echo.why)}</p>` : ''}
+      ${nowMoment ? echoNowHtml(nowMoment) : ''}
       <div class="chips">${chips.map((x, i) => `<span class="chip t${i % 4}">${esc(x)}</span>`).join('')}
         <button class="chip ghost" data-action="edit-shot" data-id="${shot.id}">${icon('edit', 14)} Edit</button>
         ${shot.takes.length > 1 ? `<button class="chip ghost" data-action="next-take" data-id="${shot.id}">Use take ${(shot.take + 1) % shot.takes.length + 1}</button>` : ''}
@@ -1161,12 +1182,14 @@ function timelineView() {
     <section class="dock">
       <div class="transport">
         <span class="mono"><span id="tc">${formatTime(cur?.start || 0)}</span> <span class="muted">/ ${formatTime(total)}</span></span>
+        ${moments.length ? `<button class="idea-toggle" data-action="toggle-ideas" aria-pressed="${state.allIdeas}">✦ ${state.allIdeas ? `All ${moments.length} ideas` : `${shownMoments.length} key ideas`}</button>` : ''}
         <button class="round" id="play-btn" data-action="play" aria-label="Play timeline" ${noShots ? 'disabled' : ''}>${icon('play', 16)}</button>
       </div>
       ${noShots ? '<button class="cta small" data-action="go" data-view="templates">PICK A TEMPLATE</button>' : `
       <div class="strip-wrap" id="strip">
         <div class="strip" style="width:${total * PX_PER_SEC + 24}px">
           ${hasSections ? `<div class="sections">${groups.map((g) => `<span style="width:${g.dur * PX_PER_SEC}px">${esc(g.name.toUpperCase())}</span>`).join('')}</div>` : ''}
+          ${markers ? `<div class="echo-lane" aria-label="Visual ideas along the song">${markers}</div>` : ''}
           <div class="slots">${slotHtml}</div>
           <div class="wave">${waveBars(p, total) || `<button class="wave-add" data-action="go" data-view="song">${icon('music', 14)} Add your song to cut on the beat</button>`}</div>
           <div class="playhead" id="playhead" style="transform:translateX(${(cur?.start || 0) * PX_PER_SEC}px)"></div>
@@ -1356,6 +1379,214 @@ function nextEmptySlot(from = 0) {
   return Math.min(from + 1, shots.length - 1);
 }
 
+// ---- Young-D-Guide: the timeline as creative director ----
+
+let momentsCache = { key: '', list: [], heads: new Map() };
+function momentsFor(p) {
+  const key = JSON.stringify([p.lyrics, p.lyricTimes, p.track?.range, p.track?.assetId, p.shots.map((s) => [s.durationSec, s.lyric])]);
+  if (momentsCache.key !== key) momentsCache = { key, list: buildMoments(p), heads: new Map() };
+  return momentsCache.list;
+}
+function echoOpts(extra = {}) {
+  const p = state.project;
+  return { weirdness: p.echoSettings.weirdness, world: p.direction.motifs || [], ...extra };
+}
+function headlineFor(m) {
+  const k = `${m.id}|${state.project.echoSettings.weirdness}|${(state.project.direction.motifs || []).join()}`;
+  if (!momentsCache.heads.has(k)) momentsCache.heads.set(k, suggest(m, echoOpts()).headline);
+  return momentsCache.heads.get(k);
+}
+function momentAt(t) {
+  const list = momentsFor(state.project);
+  let best = null;
+  for (const m of list) if (m.videoT <= t + 0.05) best = m;
+  return best;
+}
+
+function echoNowHtml(m) {
+  const idea = headlineFor(m);
+  if (!idea) return '';
+  const mk = markerFor(m, idea);
+  return `<button class="echo-now" id="echo-now" data-m="${m.id}" data-action="echo-open">
+    <span class="echo-ic" aria-hidden="true">${mk.icon}</span>
+    <span class="grow"><small>VISUAL ECHO · ${formatTime(m.t, { tenths: false })}${m.lyric ? ` · “${esc(m.lyric.length > 38 ? `${m.lyric.slice(0, 36)}…` : m.lyric)}”` : ` · ${esc(mk.label.toUpperCase())}`}</small>
+      <b>${esc(idea.text)}</b></span>
+    <span class="echo-go" aria-hidden="true">›</span>
+  </button>`;
+}
+
+const LEVEL_LABEL = ['SAFE', 'STRANGE', 'UNHINGED'];
+const KIND_LABEL_ECHO = { lyric: 'LYRIC', bass: 'BASS HIT', pause: 'BEAT PAUSE', switch: 'BEAT SWITCH', chorus: 'CHORUS', adlib: 'AD-LIB' };
+
+function ideaCard(idea, { dirLabel, icon: ic, hero = false, canSpin = true } = {}) {
+  const st = state.echo;
+  const tagLine = [idea.tags.includes('cheap') && 'cheap', idea.tags.includes('solo') && 'solo', idea.tags.includes('crew') && 'needs crew', (idea.dir === 'hybrid' || idea.tags.includes('ai')) && 'AI / compositing'].filter(Boolean);
+  const more = st.more === idea.id ? moreLike(idea, { exclude: [idea.id], world: state.project.direction.motifs || [], seed: st.seed }) : null;
+  return `<article class="idea ${hero ? 'idea-hero' : ''}">
+    <p class="idea-kicker">${hero ? `<span class="spark">${ic}</span> VISUAL ECHO` : `<span class="spark">${ic}</span> ${esc(dirLabel.toUpperCase())}`}<span class="lvl l${idea.level}">${LEVEL_LABEL[idea.level]}</span></p>
+    <h3>${esc(idea.text)}</h3>
+    <p class="why"><b>Why it connects</b> ${esc(idea.why)}</p>
+    ${tagLine.length ? `<p class="idea-tags">${tagLine.map((t) => `<span>${esc(t)}</span>`).join('')}</p>` : ''}
+    <div class="idea-actions">
+      <button class="btn primary sm" data-action="echo-use" data-id="${idea.id}">USE THIS</button>
+      <button class="btn sm ghost" data-action="echo-more" data-id="${idea.id}">${more ? 'Less' : 'More like this'}</button>
+      ${canSpin ? `<button class="btn sm ghost" data-action="echo-respin" data-id="${idea.id}" aria-label="Spin again">↻ Spin</button>` : ''}
+    </div>
+    ${more ? `<div class="more-list">${more.map((o) => `<div class="more-item"><p>${esc(o.text)}</p><small>${esc(o.why)}</small>
+      <button class="btn sm" data-action="echo-use" data-id="${o.id}">USE THIS</button></div>`).join('')}</div>` : ''}
+  </article>`;
+}
+
+function echoSheetHtml() {
+  const p = state.project;
+  const st = state.echo;
+  const list = momentsFor(p);
+  const i = list.findIndex((m) => m.id === st.mid);
+  const m = list[i];
+  if (!m) return '<p>That moment is no longer on the timeline.</p>';
+  const r = suggest(m, echoOpts({ modifiers: st.mods, seed: st.seed, exclude: st.exclude }));
+  // Remember everything shown for this moment so SPIN never serves it again.
+  for (const d of r.directions) if (!st.seen.includes(d.idea.id)) st.seen.push(d.idea.id);
+  const mk = markerFor(m, r.headline);
+  const w = p.echoSettings.weirdness;
+  const world = p.direction.motifs || [];
+  const others = r.directions.filter((d) => d.idea.id !== r.headline?.id);
+  return `<div class="echo">
+    <div class="echo-head">
+      <button class="icon-btn" data-action="echo-nav" data-dir="-1" ${i <= 0 ? 'disabled' : ''} aria-label="Previous moment">${icon('back')}</button>
+      <div class="grow">
+        <p class="eyebrow">YOUNG-D-GUIDE · ${mk.icon} ${KIND_LABEL_ECHO[m.kind] || 'MOMENT'}${m.sonic ? ` + ${KIND_LABEL_ECHO[m.sonic]}` : ''}${m.hero ? ' · HERO' : ''}</p>
+        <p class="echo-time mono">${formatTime(m.t)} ─── ${formatTime(m.end)}</p>
+      </div>
+      <button class="icon-btn flip-x" data-action="echo-nav" data-dir="1" ${i >= list.length - 1 ? 'disabled' : ''} aria-label="Next moment">${icon('back')}</button>
+    </div>
+    ${m.lyric ? `<p class="echo-lyric">“${esc(r.bridge.says)}”</p>` : `<p class="echo-lyric sonic">${esc(r.bridge.says)}</p>`}
+    <div class="chain" aria-label="Association chain">
+      <span><small>MEANS</small>${esc(r.bridge.means)}</span>
+      <span><small>FEELS</small>${esc(r.bridge.feels)}</span>
+      <span><small>WORLD</small>${esc((world.length ? world : r.bridge.motifs).join(' · '))}</span>
+    </div>
+    <div class="weird-seg" role="radiogroup" aria-label="Creative weirdness">
+      ${WEIRDNESS.map((lab, k) => `<button role="radio" aria-checked="${w === k}" class="${w === k ? 'on' : ''}" data-action="echo-weird" data-v="${k}">${lab.toUpperCase()}</button>`).join('<i></i>')}
+    </div>
+    ${r.headline ? ideaCard(r.headline, { hero: true, icon: mk.icon }) : ''}
+    <p class="eyebrow">MORE WAYS TO SHOOT THIS MOMENT</p>
+    ${others.map((d) => ideaCard(d.idea, { dirLabel: d.label, icon: d.icon })).join('')}
+    <section class="spin-box">
+      <p class="eyebrow">SPIN THIS MOMENT</p>
+      <div class="mod-chips">${MODIFIERS.map((mo) => `<button class="mod ${st.mods.includes(mo.id) ? 'on' : ''}" aria-pressed="${st.mods.includes(mo.id)}" data-action="echo-mod" data-v="${mo.id}">${mo.label}</button>`).join('')}</div>
+      <button class="btn primary big" data-action="echo-spin">↻ SPIN THIS MOMENT</button>
+    </section>
+    <section class="world-box">
+      <p class="eyebrow">VISUAL WORLD — IDEAS STAY INSIDE IT</p>
+      <div class="mod-chips">${MOTIFS.map((mo) => `<button class="mod ${world.includes(mo) ? 'on' : ''}" aria-pressed="${world.includes(mo)}" data-action="echo-world" data-v="${mo}">${mo}</button>`).join('')}</div>
+    </section>
+    <button class="btn ghost" data-action="close-sheet">Close</button>
+  </div>`;
+}
+
+function renderEcho({ keepScroll = true } = {}) {
+  const sheet = $('.sheet');
+  if (sheet?.dataset.echo) {
+    const y = sheet.scrollTop;
+    sheet.innerHTML = echoSheetHtml();
+    if (keepScroll) sheet.scrollTop = y; else sheet.scrollTop = 0;
+    return;
+  }
+  const wrap = openSheet(echoSheetHtml(), {
+    onClose: () => {
+      state.echo = null;
+      // Markers and the echo card reflect any slider/world change made in the sheet.
+      setTimeout(() => { if (state.project && !$('.sheet-wrap')) render(); }, 0);
+    },
+  });
+  wrap.querySelector('.sheet').dataset.echo = '1';
+  wrap.querySelector('.sheet').classList.add('tall');
+}
+
+function currentEchoMoment() {
+  return momentsFor(state.project).find((m) => m.id === state.echo?.mid) || null;
+}
+
+// Short, capture-time instructions: never a paragraph while the camera is up.
+function directorCard(p, slot, st) {
+  const shot = slot.shot;
+  const e = shot.echo;
+  const lens = (shot.camera.lens || st.lens || '').replace(/x\b/, '×');
+  const cam = e
+    ? [lens, e.position, e.move].filter(Boolean).join(' · ')
+    : [lens, shot.camera.move, `${shot.camera.fps || st.fps} fps`].filter(Boolean).join(' · ');
+  const steps = e?.howTo?.slice(0, 3) || (shot.description ? [shot.description] : []);
+  return `<div class="glass cam-dir director">
+    <p class="mono-tag">SHOT ${String(slot.index + 1).padStart(2, '0')} · ${formatTime(slot.start, { tenths: false })}–${formatTime(slot.end, { tenths: false })}</p>
+    ${shot.lyric ? `<p class="cam-lyric">“${esc(shot.lyric)}”</p>` : ''}
+    ${steps.length ? `<p class="mono-tag dim">DO THIS</p><ul>${steps.map((x) => `<li>${esc(x)}</li>`).join('')}</ul>` : ''}
+    <div class="dir-row"><span><small>CAMERA</small>${esc(cam)}</span><span><small>DURATION</small>${(slot.end - slot.start).toFixed(1).replace(/\.0$/, '')} sec</span></div>
+  </div>`;
+}
+
+Object.assign(handlers, {
+  'echo-open'(el) {
+    state.echo = { mid: el.dataset.m, seed: 0, mods: [], exclude: [], seen: [], more: null };
+    stopPlayback();
+    renderEcho({ keepScroll: false });
+  },
+  'echo-nav'(el) {
+    const list = momentsFor(state.project);
+    const i = list.findIndex((m) => m.id === state.echo.mid) + Number(el.dataset.dir);
+    if (!list[i]) return;
+    state.echo = { ...state.echo, mid: list[i].id, exclude: [], seen: [], more: null };
+    renderEcho({ keepScroll: false });
+  },
+  'echo-weird'(el) {
+    state.project.echoSettings.weirdness = Number(el.dataset.v);
+    state.echo.exclude = [];
+    commit({ render: false });
+    renderEcho();
+  },
+  'echo-mod'(el) {
+    const v = el.dataset.v;
+    const mods = state.echo.mods;
+    state.echo.mods = mods.includes(v) ? mods.filter((x) => x !== v) : [...mods, v];
+    state.echo.exclude = [];
+    renderEcho();
+  },
+  'echo-spin'() {
+    state.echo.seed += 1;
+    state.echo.exclude = state.echo.seen.slice(-60);
+    state.echo.more = null;
+    renderEcho({ keepScroll: false });
+  },
+  'echo-respin'(el) {
+    state.echo.exclude = [...state.echo.exclude, el.dataset.id];
+    state.echo.more = null;
+    renderEcho();
+  },
+  'echo-more'(el) {
+    state.echo.more = state.echo.more === el.dataset.id ? null : el.dataset.id;
+    renderEcho();
+  },
+  'echo-world'(el) {
+    const d = state.project.direction;
+    d.motifs = d.motifs || [];
+    d.motifs = d.motifs.includes(el.dataset.v) ? d.motifs.filter((x) => x !== el.dataset.v) : [...d.motifs, el.dataset.v];
+    commit({ render: false });
+    renderEcho();
+  },
+  'echo-use'(el) {
+    const m = currentEchoMoment();
+    const idea = getIdea(el.dataset.id);
+    if (!m || !idea) return;
+    const idx = applyIdea(state.project, m, idea, createShot);
+    state.sel = idx;
+    state.echo = null;
+    closeSheet();
+    commit();
+    toast(`${label(idx)} planned ✦ — undo from Plan › Shots`, 'ok');
+  },
+  'toggle-ideas'() { state.allIdeas = !state.allIdeas; render(); },
+});
+
 // ---- camera overlay ----
 
 const cam = { stream: null, facing: 'environment', busy: false, abort: null };
@@ -1373,16 +1604,12 @@ function camOverlayHtml() {
       <div class="glass cam-info"><span class="mono-tag">${label(s.index)} · SLOT ${(s.end - s.start).toFixed(1)}s · TAKE ${shot.takes.length + 1}</span><b>${esc(shot.title)}</b></div>
     </div>
     <div class="cam-count" id="cam-count" aria-live="assertive"></div>
-    <div class="glass cam-dir">
-      ${shot.description ? `<p>${esc(shot.description)}</p>` : ''}
-      ${shot.lyric ? `<p class="cam-lyric">“${esc(shot.lyric)}”</p>` : ''}
-      <p class="mono-tag dim">${esc([shot.camera.lens || st.lens, shot.camera.move, `${shot.camera.fps || st.fps} FPS`].filter(Boolean).join(' · ').toUpperCase())}</p>
-    </div>
+    ${directorCard(p, s, st)}
     <div class="cam-bottom">
       <div class="cam-progress">${slots.map((x) => `<i style="flex-grow:${x.end - x.start}" class="${x.index === s.index ? 'cur' : currentTake(x.shot) ? 'done' : ''}">${x.index === s.index ? '<b id="cam-fill"></b>' : ''}</i>`).join('')}</div>
       <div class="cam-controls">
         <button class="cam-side" data-action="cam-native">iPhone<br>camera</button>
-        <button class="rec" id="rec-btn" data-action="cam-record" aria-label="Record ${label(s.index)}"><span></span></button>
+        <span class="rec-wrap"><button class="rec" id="rec-btn" data-action="cam-record" aria-label="Start countdown and record ${label(s.index)}"><span></span></button><small class="rec-label">START COUNTDOWN</small></span>
         <button class="cam-side" data-action="cam-flip" aria-label="Switch camera">${icon('flip', 22)}</button>
       </div>
     </div>`;

@@ -157,6 +157,35 @@ try {
   await page.waitForSelector('.slot');
   await shot('07-timeline-filled');
 
+  step('Young-D-Guide: marker → six directions → spin → use → director mode');
+  await page.waitForSelector('.echo-mark');
+  const markerCount = (await page.$$('.echo-mark')).length;
+  check(markerCount >= 3, `idea markers on the timeline (${markerCount})`);
+  await page.click('.echo-mark >> nth=0');
+  await page.waitForSelector('.idea-hero');
+  check((await page.$$('.echo .idea')).length === 6, 'headline + five more directions');
+  await page.waitForTimeout(300);
+  await shot('07b-echo');
+  const firstIdea = await page.textContent('.idea-hero h3');
+  await page.click('[data-action="echo-weird"][data-v="2"]');
+  await page.waitForSelector('.weird-seg button.on[data-v="2"]');
+  await page.click('[data-action="echo-mod"][data-v="cheap"]');
+  await page.click('[data-action="echo-spin"]');
+  await page.waitForTimeout(200);
+  check((await page.textContent('.idea-hero h3')) !== firstIdea, 'spin gives a new headline');
+  await page.click('.idea-hero [data-action="echo-more"]');
+  await page.waitForSelector('.idea-hero .more-list .more-item');
+  const chosen = await page.textContent('.idea-hero h3');
+  await page.click('.idea-hero > .idea-actions [data-action="echo-use"]');
+  await page.waitForSelector('.shot-why');
+  check((await page.textContent('.shot-desc')).trim() === chosen.trim(), 'USE THIS put the idea into the slot');
+  await page.click('[data-action="open-camera"]');
+  await page.waitForSelector('.director');
+  check(/DO THIS/.test(await page.textContent('.director')), 'director card shows DO THIS');
+  await shot('07c-director');
+  await page.click('[data-action="cam-close"]');
+  await page.waitForSelector('.slot');
+
   step('make the final video');
   await page.click('[data-action="open-save"]');
   await page.waitForSelector('[data-action="make-video"]');

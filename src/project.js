@@ -48,6 +48,8 @@ export function createShot(partial = {}) {
       assetId: t.assetId, thumbId: t.thumbId || null, at: t.at || new Date().toISOString(), dur: Number(t.dur) || 0,
     })) : [],
     take: Number.isInteger(partial.take) ? partial.take : 0,
+    // Young-D-Guide idea this shot came from: why it connects, how to shoot it, cut points.
+    echo: partial.echo ? JSON.parse(JSON.stringify(partial.echo)) : null,
   };
 }
 
@@ -66,6 +68,7 @@ export function createProject(partial = {}) {
     direction: {
       logline: '', concept: '', mood: '',
       palette: [], visualRules: [], references: [], wardrobe: [],
+      motifs: [], // the video's visual world (water, glass, chrome…) that keeps ideas cohesive
       ...(partial.direction || {}),
     },
     imageRhymes: (partial.imageRhymes || []).map((r) => ({
@@ -94,6 +97,7 @@ export function createProject(partial = {}) {
     // Seconds into the song where each lyric line starts (parallel to `lyrics`); null = not synced.
     lyricTimes: Array.isArray(partial.lyricTimes) ? [...partial.lyricTimes] : [],
     captions: { ...DEFAULT_CAPTIONS, ...(partial.captions || {}) },
+    echoSettings: { weirdness: 1, markers: 'strongest', ...(partial.echoSettings || {}) },
   };
   return p;
 }
@@ -171,7 +175,7 @@ export function duplicateProject(project, { resetProgress = false, name } = {}) 
 export const IDEA_FIELDS = ['title', 'description', 'camera', 'location', 'props', 'durationSec'];
 
 function snapshotIdea(shot) {
-  const snap = { at: now() };
+  const snap = { at: now(), lyric: shot.lyric, echo: shot.echo ? JSON.parse(JSON.stringify(shot.echo)) : null };
   for (const f of IDEA_FIELDS) snap[f] = JSON.parse(JSON.stringify(shot[f]));
   return snap;
 }
@@ -206,6 +210,8 @@ export function restorePreviousIdea(project, shotId) {
   if (!shot || !shot.history.length) return null;
   const prev = shot.history.pop();
   for (const f of IDEA_FIELDS) if (prev[f] !== undefined) shot[f] = prev[f];
+  if ('echo' in prev) shot.echo = prev.echo;
+  if (prev.lyric !== undefined) shot.lyric = prev.lyric;
   touch(project);
   return shot;
 }
@@ -288,6 +294,7 @@ export function demoProject() {
       visualRules: ['Always keep one reflective surface in frame', 'Artist in sharp focus, city soft', 'Shoot choruses at 60fps for slow-motion options', 'No cool white light — warm only'],
       references: ['Wong Kar-wai step-printing', 'Solange — "Cranes in the Sky" framing', 'Late-afternoon taxi rank chaos'],
       wardrobe: ['Mustard coat', 'Silver hoops', 'White sneakers (spare pair for rain)'],
+      motifs: ['glass', 'mirrors', 'light'],
     },
     imageRhymes: [
       { motif: 'Reflection in glass', first: 'S01 taxi window', echo: 'S06 shop window', meaning: 'She is chasing a version of herself' },

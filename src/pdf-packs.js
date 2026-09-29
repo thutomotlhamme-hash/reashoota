@@ -108,7 +108,9 @@ export function renderFlowPdf(kind, project, { frames } = {}) {
         const rows = [
           ['What', s.description], ['Lyric', s.lyric && `“${s.lyric}”`], ['Camera', cameraLine(s)],
           ['Location', s.location], ['Props', s.props.join(', ')],
-          ['Duration', s.durationSec ? `${s.durationSec}s` : ''], ['Notes', s.notes],
+          ['Duration', s.durationSec ? `${s.durationSec}s` : ''],
+          ['Why', s.echo?.why], ['Light', s.echo?.light], ['Do this', s.echo?.howTo?.join(' → ')],
+          ['AI', s.echo?.ai], ['Cut', s.echo?.cut], ['Notes', s.notes],
         ].filter(([, v]) => v);
         const wrapped = rows.map(([k, v]) => [k, wrapText(v, textW - 58, 9.5)]);
         const h = Math.max(24 + wrapped.reduce((n, [, l]) => n + l.length * 12.5, 0), img ? thumbW * 16 / 9 + 16 : 0) + 8;
